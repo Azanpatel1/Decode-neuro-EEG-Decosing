@@ -195,11 +195,24 @@ print(d.probability, d.latency_ms)
   overt scaffolding, not word ID, to time stimulation.
 - **Always read `metrics.json` against the permutation `null_mean`**, not against
   zero. A number above chance with a low p-value is the only thing that counts.
-- **GO "rest" is real baseline.** The rest class comes from the dataset's
-  `*_baseline-epo.fif` recordings, sliced into action-length windows and
-  subsampled per subject to match attempt counts. If those files are missing the
-  GO task raises — rest is never synthesized, because a rest class built from
-  scaled-down attempt epochs would be trivially separable and the GO score
-  meaningless.
+- **GO "rest" is real baseline — and its score is a block confound, not a
+  decoder.** Rest comes from the dataset's `*_baseline-epo.fif` recordings, sliced
+  into action-length windows and subsampled per subject to match attempt counts
+  (nothing is synthesized; missing baselines raise). But that block differs from
+  the task blocks in far more than speech attempt: ~1.6× the broadband amplitude,
+  plus eyes-closed/arousal and drift differences. Measured on ds003626 at a
+  matched 0.5 s window, holding the action epochs fixed and changing only where
+  rest comes from:
+
+  | Rest source | LOSO balanced acc | AUC |
+  |---|---|---|
+  | Separate baseline block | 0.798 | 0.867 |
+  | Pre-cue interval, same trials | 0.540 | 0.561 |
+
+  So the headline GO number (0.92 at a 2.5 s window) mostly reflects *which block
+  a window came from*. Online, rest is same-block rest, where this pipeline sits
+  near chance. **Do not use a baseline-block GO model to gate stimulation.** For a
+  deployable gate, record calibration data on your own hardware with rest
+  interleaved into the same session as the attempts.
 - **Label columns:** auto-detection is robust but verify the printed class
   distribution on your first real run; override in `_autodetect_columns` if needed.

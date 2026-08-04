@@ -55,6 +55,30 @@ class RiemannianAlignment(BaseEstimator, TransformerMixin):
         return self.iM_ @ X @ self.iM_
 
 
+class TraceNormalize(BaseEstimator, TransformerMixin):
+    """Scale each covariance matrix to unit trace, removing global signal power.
+
+    Why this matters here: ds003626's rest class comes from a separate 15 s
+    baseline block whose broadband amplitude is ~1.6x the action epochs', so an
+    unnormalised covariance pipeline can separate rest from attempt on overall
+    power alone -- a block/drift artifact, not a speech-attempt signature. A
+    decoder built on that cue would fire on movement and impedance drift online.
+    Normalising the trace forces the classifier onto the spatial *correlation
+    structure* instead.
+
+    The cost is that genuine power changes (ERD/ERS) are discarded too, so this
+    trades some real signal for a cue that transfers to live use. It is a Pipeline
+    step, so training and the online decoder get it identically (Invariant A).
+    """
+
+    def fit(self, X: np.ndarray, y=None):
+        return self
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        tr = np.trace(X, axis1=-2, axis2=-1)[..., None, None]
+        return X / np.clip(tr, 1e-12, None) * X.shape[-1]
+
+
 class FilterBankCovariances(BaseEstimator, TransformerMixin):
     """Optional light filter bank: covariance per frequency band, block-diagonally
     stacked. Captures mu / beta / low-gamma structure the design doc highlights.
@@ -113,6 +137,9 @@ def build_pipeline(cfg: Config) -> Pipeline:
         steps.append(("cov", FilterBankCovariances(cfg.sfreq, cfg.freq_bands, cfg.cov_estimator)))
     else:
         steps.append(("cov", Covariances(estimator=cfg.cov_estimator)))
+
+    if cfg.trace_normalize:
+        steps.append(("norm", TraceNormalize()))
 
     if cfg.align:
         steps.append(("align", RiemannianAlignment(metric=cfg.metric)))

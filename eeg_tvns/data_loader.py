@@ -72,30 +72,103 @@ class Epochs:
 # ---------------------------------------------------------------------------
 # Montage selection (emulate a low-density wearable)
 # ---------------------------------------------------------------------------
+def _nearest_by_position(
+    ch_names: List[str], wanted: List[str], source_montage: str = "biosemi128",
+    warn_dist_m: float = 0.025,
+) -> Optional[Tuple[List[int], List[str]]]:
+    """Map high-density electrode labels onto `wanted` 10-20 sites by 3D position.
+
+    ds003626 is a 128-channel BioSemi cap labelled A1..D32, so the wearable 10-20
+    names we want mostly do not appear -- and matching by *name* is actively
+    dangerous: BioSemi 'C3'/'C4' exist but sit nowhere near 10-20 C3/C4 over
+    sensorimotor cortex. Instead we look up both label sets in their standard
+    montages and pick, for each wanted site, the closest unused source electrode.
+
+    Returns (indices into ch_names, wanted-site names) or None if the positions
+    are unavailable. The returned names are the 10-20 site labels, so the model
+    bundle records where the channels actually are -- which is what lets the live
+    board be remapped onto the trained montage (Invariant D).
+    """
+    try:
+        import mne
+
+        src_pos = mne.channels.make_standard_montage(source_montage).get_positions()["ch_pos"]
+        tgt_pos = mne.channels.make_standard_montage("standard_1020").get_positions()["ch_pos"]
+    except Exception:
+        log.warning("Could not load standard montages for position mapping.", exc_info=True)
+        return None
+
+    available = [(i, n) for i, n in enumerate(ch_names) if n in src_pos]
+    if len(available) < len(wanted):
+        return None
+
+    idx, names, used, report = [], [], set(), []
+    for site in wanted:
+        if site not in tgt_pos:
+            log.warning("10-20 site %s not in standard_1020; skipping.", site)
+            continue
+        target = tgt_pos[site]
+        best, best_d = None, np.inf
+        for i, n in available:
+            if i in used:
+                continue
+            d = float(np.linalg.norm(src_pos[n] - target))
+            if d < best_d:
+                best, best_d = (i, n), d
+        if best is None:
+            continue
+        used.add(best[0])
+        idx.append(best[0])
+        names.append(site)
+        report.append(f"{site}<-{best[1]}({best_d * 1000:.0f}mm)")
+        if best_d > warn_dist_m:
+            log.warning("Nearest electrode to %s is %s, %.0f mm away -- coarse match.",
+                        site, best[1], best_d * 1000)
+
+    if len(idx) < max(4, len(wanted) // 2):
+        return None
+    order = np.argsort(idx)
+    idx = [idx[i] for i in order]
+    names = [names[i] for i in order]
+    log.info("Mapped %d high-density electrodes onto 10-20 sites by position: %s",
+             len(idx), ", ".join(report))
+    return idx, names
+
+
+def resolve_montage_indices(
+    ch_names: List[str], wanted: List[str]
+) -> Tuple[List[int], List[str]]:
+    """Resolve `wanted` low-density sites to indices into `ch_names`.
+
+    Tries exact names, then nearest-position mapping for high-density caps, then
+    falls back to evenly-spaced channels. Returned separately from the data so a
+    long recording can be reduced per session instead of after concatenation.
+    """
+    exact = [ch_names.index(c) for c in wanted if c in ch_names]
+    if len(exact) == len(wanted):
+        log.info("Using %d named low-density channels.", len(exact))
+        return exact, [ch_names[i] for i in exact]
+
+    mapped = _nearest_by_position(ch_names, wanted)
+    if mapped is not None:
+        return mapped
+
+    n_keep = min(len(wanted), len(ch_names))
+    idx = sorted(set(np.linspace(0, len(ch_names) - 1, n_keep).round().astype(int).tolist()))
+    names = [ch_names[i] for i in idx]
+    log.warning(
+        "Could not resolve montage by name or position; falling back to %d "
+        "evenly-spaced channels: %s. These labels do NOT carry 10-20 positions, "
+        "so a live board cannot be reliably remapped onto them.", len(idx), names,
+    )
+    return idx, names
+
+
 def select_montage(
     X: np.ndarray, ch_names: List[str], wanted: List[str]
 ) -> Tuple[np.ndarray, List[str]]:
-    """Return X and names restricted to `wanted`.
-
-    If the named channels exist, use them. Otherwise emulate a low-density
-    montage by evenly sub-sampling channel indices (with a warning), so a run
-    on data with non-standard channel labels (e.g. BioSemi A1..D32) still works.
-    """
-    idx = [ch_names.index(c) for c in wanted if c in ch_names]
-    if len(idx) >= max(4, len(wanted) // 2):
-        names = [ch_names[i] for i in idx]
-        log.info("Using %d named low-density channels: %s", len(idx), names)
-        return X[:, idx, :], names
-
-    n_keep = min(len(wanted), X.shape[1])
-    idx = np.linspace(0, X.shape[1] - 1, n_keep).round().astype(int)
-    idx = sorted(set(idx.tolist()))
-    names = [ch_names[i] for i in idx]
-    log.warning(
-        "Requested montage names not found in data; falling back to %d "
-        "evenly-spaced channels to emulate low density: %s",
-        len(idx), names,
-    )
+    """Return X and names restricted to the resolved low-density montage."""
+    idx, names = resolve_montage_indices(ch_names, wanted)
     return X[:, idx, :], names
 
 
@@ -155,15 +228,23 @@ def _find_subject_files(data_root: str) -> dict:
     return out
 
 
-def _slice_into_windows(epoch_data: np.ndarray, n_samp: int) -> List[np.ndarray]:
-    """Cut a (channels, samples) recording into consecutive `n_samp` windows.
+def _slice_into_windows(
+    epoch_data: np.ndarray, n_samp: int, overlap: float = 0.0
+) -> List[np.ndarray]:
+    """Cut a (channels, samples) recording into `n_samp` windows.
 
-    Used to turn each long baseline recording into rest trials the same length as
-    the action epochs. Any remainder shorter than one window is dropped rather
-    than padded -- padding would invent samples.
+    Used to turn each baseline recording into rest trials the same length as the
+    action epochs. `overlap` (0..1) is the fraction shared between consecutive
+    windows. Any remainder shorter than one window is dropped rather than padded --
+    padding would invent samples.
     """
-    n_win = epoch_data.shape[1] // n_samp
-    return [epoch_data[:, w * n_samp:(w + 1) * n_samp] for w in range(n_win)]
+    step = max(1, int(round(n_samp * (1.0 - min(max(overlap, 0.0), 0.95)))))
+    out = []
+    start = 0
+    while start + n_samp <= epoch_data.shape[1]:
+        out.append(epoch_data[:, start:start + n_samp])
+        start += step
+    return out
 
 
 def _load_events(path: str) -> np.ndarray:
@@ -230,6 +311,11 @@ def load_inner_speech(cfg: Config) -> Epochs:
     # length is known. Only collected for the GO task, which needs a rest class.
     baseline_raw: List[Tuple[object, np.ndarray]] = []
     sessions_missing_baseline: List[str] = []
+    # Channel reduction is resolved once and applied per session: the full 128-ch
+    # epochs are ~236 MB each, so reducing after concatenating all 30 sessions
+    # would need tens of GB of RAM.
+    sel_idx: Optional[List[int]] = None
+    sel_names: Optional[List[str]] = None
 
     for sid in wanted_subjects:
         for fif, ev, baseline_fif in subj_files.get(sid, []):
@@ -259,22 +345,46 @@ def load_inner_speech(cfg: Config) -> Epochs:
             s0, s1 = max(0, s0), min(data.shape[2], s1)
             data = data[:, :, s0:s1]
 
+            # Reduce channels here, per session: the full 128-ch epochs are
+            # ~236 MB each, so reducing only after concatenating all 30 sessions
+            # would need tens of GB. Filtering is per-channel, so reducing before
+            # the band-pass gives identical results to reducing after.
+            if cfg.use_low_density and sel_idx is None:
+                sel_idx, sel_names = resolve_montage_indices(ch_names, LOW_DENSITY_MONTAGE)
+            if sel_idx is not None:
+                data = data[:, sel_idx, :]
+
             mask = np.isin(cnd, list(keep_conditions))
             Xs.append(data[mask])
             ys.append(cls[mask])
             conds.append(cnd[mask])
             subs.append(np.full(mask.sum(), sid if isinstance(sid, int) else 0))
-            ch_names_ref = ch_names_ref or ch_names
+            ch_names_ref = ch_names_ref or (sel_names if sel_idx is not None else ch_names)
 
             if cfg.task == "go":
                 if baseline_fif is None:
                     sessions_missing_baseline.append(fif)
                 else:
                     bep = mne.read_epochs(baseline_fif, preload=True, verbose="ERROR")
-                    bep.pick("eeg")
+                    # Select by NAME, not by type: the baseline files type the 8
+                    # external channels as EEG while the action epochs do not, so
+                    # pick("eeg") yields 136 vs 128. Matching names (and ordering
+                    # to them) keeps rest and attempt on the same montage.
+                    missing = [c for c in ch_names if c not in bep.ch_names]
+                    if missing:
+                        raise ValueError(
+                            f"{os.path.basename(baseline_fif)} is missing "
+                            f"{len(missing)} channel(s) present in the action "
+                            f"epochs (e.g. {missing[:5]}). Refusing to guess a mapping."
+                        )
+                    bep.pick(ch_names)
+                    bep.reorder_channels(ch_names)
                     if abs(bep.info["sfreq"] - cfg.sfreq) > 1e-3:
                         bep.resample(cfg.sfreq, verbose="ERROR")
-                    baseline_raw.append((sid, bep.get_data(copy=True)))
+                    bdata = bep.get_data(copy=True)
+                    if sel_idx is not None:
+                        bdata = bdata[:, sel_idx, :]
+                    baseline_raw.append((sid, bdata))
 
     X = np.concatenate(Xs, axis=0)
     y_class = np.concatenate(ys, axis=0)
@@ -292,16 +402,54 @@ def load_inner_speech(cfg: Config) -> Epochs:
 
     X = _preprocess_array(X, cfg.sfreq, cfg)
 
-    if cfg.use_low_density:
-        full_ch_names = list(ch_names_ref or [])
-        X, ch_names_ref = select_montage(X, full_ch_names, LOW_DENSITY_MONTAGE)
-        if rest_X is not None:
-            rest_X, _ = select_montage(rest_X, full_ch_names, LOW_DENSITY_MONTAGE)
-
     return _finalize_task(
         X, y_class, subjects, condition, cfg, cfg.sfreq, ch_names_ref,
         rest_X=rest_X, rest_subjects=rest_subjects,
     )
+
+
+def _balance_go_classes(
+    X: np.ndarray,
+    subjects: np.ndarray,
+    rest_X: np.ndarray,
+    rest_subjects: np.ndarray,
+    cfg: Config,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Trim the majority class per subject so attempt/rest counts are comparable.
+
+    ds003626 ships ~15 s of baseline per session against hundreds of action
+    epochs, so attempts outnumber rest heavily. Left alone, a classifier can
+    score well by leaning on the prior; balancing per subject keeps each domain's
+    recentering and the LOSO folds interpretable. This only ever *drops* real
+    trials -- nothing is duplicated, weighted, or synthesized.
+    """
+    rng = np.random.default_rng(cfg.random_state)
+    keep_att, keep_rest = [], []
+    for sid in np.unique(np.concatenate([subjects, rest_subjects])):
+        a_idx = np.flatnonzero(subjects == sid)
+        r_idx = np.flatnonzero(rest_subjects == sid)
+        n = min(len(a_idx), len(r_idx))
+        if n == 0:
+            log.warning("sub-%s: has %d attempt and %d rest trials; dropping it "
+                        "from the GO problem.", sid, len(a_idx), len(r_idx))
+            continue
+        if len(a_idx) > n:
+            a_idx = np.sort(rng.choice(a_idx, size=n, replace=False))
+        if len(r_idx) > n:
+            r_idx = np.sort(rng.choice(r_idx, size=n, replace=False))
+        keep_att.append(a_idx)
+        keep_rest.append(r_idx)
+
+    if not keep_att:
+        raise ValueError(
+            "No subject has both attempt and rest trials; cannot build the GO "
+            "problem. Check that '*_baseline-epo.fif' files loaded correctly."
+        )
+    ka = np.concatenate(keep_att)
+    kr = np.concatenate(keep_rest)
+    log.info("Balanced GO classes: kept %d/%d attempt and %d/%d rest trials.",
+             len(ka), len(X), len(kr), len(rest_X))
+    return X[ka], subjects[ka], rest_X[kr], rest_subjects[kr]
 
 
 def _build_rest_from_baseline(
@@ -339,20 +487,26 @@ def _build_rest_from_baseline(
     rng = np.random.default_rng(cfg.random_state)
     windows: List[np.ndarray] = []
     subs: List[int] = []
+    # Sessions of the same subject are pooled, so accumulate per subject first.
+    per_subject: dict = {}
     for sid, bdata in baseline_raw:
         sid_int = sid if isinstance(sid, int) else 0
-        subj_windows: List[np.ndarray] = []
         for epoch_data in bdata:  # (channels, samples)
-            subj_windows.extend(_slice_into_windows(epoch_data, n_samp))
+            per_subject.setdefault(sid_int, []).extend(
+                _slice_into_windows(epoch_data, n_samp, cfg.baseline_overlap)
+            )
+
+    for sid_int, subj_windows in sorted(per_subject.items()):
         if not subj_windows:
             log.warning("sub-%s: baseline shorter than one %d-sample window; "
-                        "no rest trials from it.", sid, n_samp)
+                        "no rest trials from it.", sid_int, n_samp)
             continue
-        # Cap at this subject's attempt count to keep the classes comparable.
         n_attempts = int(np.sum(attempt_subjects == sid_int))
-        if n_attempts and len(subj_windows) > n_attempts:
+        if cfg.balance_go_classes and n_attempts and len(subj_windows) > n_attempts:
             pick = rng.choice(len(subj_windows), size=n_attempts, replace=False)
             subj_windows = [subj_windows[i] for i in sorted(pick)]
+        log.info("sub-%s: %d attempt vs %d rest windows.",
+                 sid_int, n_attempts, len(subj_windows))
         windows.extend(subj_windows)
         subs.extend([sid_int] * len(subj_windows))
 
@@ -370,6 +524,17 @@ def _build_rest_from_baseline(
         )
     log.info("GO rest class: %d real baseline windows from %d session(s).",
              len(rest_X), len(baseline_raw))
+    log.warning(
+        "GO rest comes from the separate '*_baseline-epo.fif' block, which differs "
+        "from the task blocks in more than speech attempt (~1.6x broadband "
+        "amplitude, eyes-closed/arousal and drift differences). Measured on "
+        "ds003626 at a matched 0.5 s window: baseline-block rest scores 0.80 LOSO "
+        "balanced accuracy, but same-block rest (pre-cue interval of the same "
+        "trials) scores only 0.54. Treat this task's score as an UPPER BOUND that "
+        "mostly reflects block identity, and do NOT use a model trained this way "
+        "to gate stimulation -- online, rest is same-block rest. For a deployable "
+        "gate, record calibration data with rest interleaved in the same session."
+    )
     return rest_X, np.asarray(subs, int)
 
 
@@ -403,6 +568,11 @@ def _finalize_task(
         raise ValueError(
             "The GO task requires real rest epochs, but none were supplied. "
             "Rest is never synthesized -- see _build_rest_from_baseline."
+        )
+
+    if cfg.balance_go_classes:
+        X, subjects, rest_X, rest_subjects = _balance_go_classes(
+            X, subjects, rest_X, rest_subjects, cfg
         )
 
     Xg = np.concatenate([X, rest_X], axis=0)

@@ -16,7 +16,8 @@ real recordings, and its reported accuracy must mean something.
     python run.py --data ./ds003626 --task go   --condition overt_scaffold
     python run.py --data ./ds003626 --task word --condition inner
 
-Outputs (in ./outputs): trained model (.joblib), metrics.json, and plots.
+Outputs (in ./outputs), suffixed per task: model_<task>.joblib,
+metrics_<task>.json, and plots.
 """
 from __future__ import annotations
 
@@ -103,7 +104,7 @@ def maybe_plots(cfg: Config, xsub, latency) -> list:
                             color="white" if cm[i, j] > 0.5 else "black", fontsize=8)
             fig.colorbar(im, fraction=0.046)
             fig.tight_layout()
-            cpath = os.path.join(cfg.out_dir, "confusion_matrix.png")
+            cpath = os.path.join(cfg.out_dir, f"confusion_matrix_{cfg.task}.png")
             fig.savefig(cpath, dpi=140); plt.close(fig); paths.append(cpath)
 
         lat = latency["_latencies"]
@@ -114,7 +115,7 @@ def maybe_plots(cfg: Config, xsub, latency) -> list:
         ax.set_xlabel("decode latency (ms)"); ax.set_ylabel("count")
         ax.set_title("Closed-loop decision latency"); ax.legend()
         fig.tight_layout()
-        lpath = os.path.join(cfg.out_dir, "latency_hist.png")
+        lpath = os.path.join(cfg.out_dir, f"latency_hist_{cfg.task}.png")
         fig.savefig(lpath, dpi=140); plt.close(fig); paths.append(lpath)
     except Exception as exc:  # plotting is optional
         logging.getLogger("eeg_tvns").warning("Plotting skipped: %s", exc)
@@ -185,14 +186,17 @@ def main() -> None:
         "permutation": {k: v for k, v in (perm or {}).items()},
         "latency": {k: v for k, v in latency.items() if not k.startswith("_")},
     }
-    with open(os.path.join(cfg.out_dir, "metrics.json"), "w") as fh:
+    # Per-task filename: the go and word runs would otherwise clobber each other's
+    # results, silently leaving metrics that describe a different decoder.
+    metrics_path = os.path.join(cfg.out_dir, f"metrics_{cfg.task}.json")
+    with open(metrics_path, "w") as fh:
         json.dump(metrics, fh, indent=2, default=float)
 
     plots = maybe_plots(cfg, xsub, latency)
 
     print("\n" + "=" * 64)
     print(f"Saved model  -> {model_path}")
-    print(f"Saved metrics-> {os.path.join(cfg.out_dir, 'metrics.json')}")
+    print(f"Saved metrics-> {metrics_path}")
     for pth in plots:
         print(f"Saved plot   -> {pth}")
     print("=" * 64)

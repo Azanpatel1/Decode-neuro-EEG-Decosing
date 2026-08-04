@@ -55,11 +55,29 @@ class Config:
     tmax: float = 3.5                     # action-window end,   s from cue
     filter_bank: bool = False             # if True, stack band-limited covariances
 
+    # --- GO task rest class -------------------------------------------------
+    # Overlap fraction between consecutive rest windows cut from each
+    # '*_baseline-epo.fif' recording. ds003626 ships only ~15 s of baseline per
+    # session, so non-overlapping windows yield ~6 rest trials against ~120
+    # attempts; overlap recovers more real windows from the same recording.
+    # Overlapping windows are correlated, but LOSO holds out whole subjects so
+    # they never straddle a train/test boundary. 0.0 disables overlap.
+    baseline_overlap: float = 0.5
+    # Downsample the majority class per subject so attempt/rest are comparable.
+    # Only ever drops real trials -- nothing is duplicated or synthesized.
+    balance_go_classes: bool = True
+
     # --- montage -----------------------------------------------------------
     use_low_density: bool = True          # emulate wearable montage (recommended)
 
     # --- model -------------------------------------------------------------
     cov_estimator: str = "oas"            # regularised covariance (good for short/low-ch)
+    # Scale each covariance to unit trace, so decoding uses spatial pattern rather
+    # than overall signal power. Needed because the GO rest class comes from a
+    # baseline block with ~1.6x the amplitude of the action epochs; without this
+    # the GO score largely reflects that block/drift difference and would not
+    # transfer to live use. See pipeline.TraceNormalize.
+    trace_normalize: bool = True
     metric: str = "riemann"               # Riemannian metric for mean / tangent space
     align: bool = True                    # Riemannian Alignment (per-domain recentering)
     classifier: str = "lda"               # "lda" | "logreg" | "mdm" | "svm"

@@ -30,7 +30,12 @@ from pyriemann.utils.base import invsqrtm
 
 from .config import Config
 from .data_loader import Epochs
-from .pipeline import FilterBankCovariances, _make_classifier, build_pipeline
+from .pipeline import (
+    FilterBankCovariances,
+    TraceNormalize,
+    _make_classifier,
+    build_pipeline,
+)
 
 log = logging.getLogger("eeg_tvns.eval")
 
@@ -80,9 +85,20 @@ class EvalResult:
 # Covariance helpers (shared)
 # ---------------------------------------------------------------------------
 def _covariances(X: np.ndarray, cfg: Config) -> np.ndarray:
+    """Covariance features for the evaluation paths.
+
+    Must stay in step with `pipeline.build_pipeline`'s cov (+ normalise) stages:
+    LOSO and the permutation test build features here rather than through the
+    Pipeline, so any feature-stage change made there has to be mirrored here or
+    the headline score would describe different features than the saved model.
+    """
     if cfg.filter_bank:
-        return FilterBankCovariances(cfg.sfreq, cfg.freq_bands, cfg.cov_estimator).fit_transform(X)
-    return Covariances(estimator=cfg.cov_estimator).fit_transform(X)
+        covs = FilterBankCovariances(cfg.sfreq, cfg.freq_bands, cfg.cov_estimator).fit_transform(X)
+    else:
+        covs = Covariances(estimator=cfg.cov_estimator).fit_transform(X)
+    if cfg.trace_normalize:
+        covs = TraceNormalize().fit_transform(covs)
+    return covs
 
 
 def _align_per_domain(covs: np.ndarray, domains: np.ndarray, metric: str) -> np.ndarray:

@@ -230,6 +230,17 @@ The old low-power surrogate is gone and must not come back (Invariant F). Still
 worth verifying against real data: confirm the printed attempt/rest counts are
 balanced and that GO LOSO beats its permutation baseline.
 
+**T2b — Record same-session calibration data for a deployable GO gate.**
+The ds003626 GO problem is confounded: its only rest is a separate baseline block,
+and at a matched 0.5 s window baseline-block rest scores 0.80 LOSO balanced
+accuracy while same-block rest (pre-cue interval of the same trials) scores 0.54.
+The high GO numbers therefore reflect block identity, not speech attempt, and a
+model trained that way must not gate stimulation. What's needed: a calibration
+recording on the target hardware that interleaves cued attempt and cued rest
+within one session, so both classes share block, impedance and arousal context.
+*Accept when:* `--task go` can be built from a same-session calibration recording,
+and its LOSO/within-session score is reported next to the same-block control above.
+
 **T3 — Add stimulation control arms.**
 Add `paired` (current behavior), `unpaired/delayed`, and `sham` modes to
 `run_loop` (config flag), so the experiment can show the effect is timing-
@@ -280,7 +291,10 @@ test before declaring done.
 - Don't let the word (4-class) decoder trigger stimulation (Invariant C).
 - Don't put transformers/RNNs/foundation models/GPU inference in the online path
   (Golden Constraint 3). They're fine as *offline* research comparisons.
-- Don't claim an accuracy number without its permutation chance baseline.
+- Don't claim an accuracy number without its permutation chance baseline. Note
+  that a permutation test does NOT catch a block confound: the ds003626 GO task
+  passes at p=0.005 while mostly decoding which recording block a window came
+  from. Compare against a same-block control too (see T2b).
 - Don't reintroduce synthetic data or a simulated stream in any form — no
   `make_synthetic`, no `SimulatedStreamer`, no `--synthetic`/`--simulate`, no
   random-noise fallback for a missing window or a missing dataset (Invariant F /
