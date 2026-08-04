@@ -9,9 +9,14 @@ the project's algorithm report:
 > with a **binary GO decoder** (speech-attempt vs. rest) that gates stimulation
 > and a **4-class word decoder** (up / down / left / right) for tracking.
 
-Everything is open source (pyRiemann · MNE · scikit-learn). It runs **out of the
-box on synthetic EEG** (no download) and on the real **Nieto "Thinking out loud"**
-dataset (OpenNeuro **ds003626**).
+Everything is open source (pyRiemann · MNE · scikit-learn).
+
+**Real data only.** This platform has no synthetic dataset and no simulated
+stream. Both were removed deliberately: on a strip chart, generated traces are
+indistinguishable from EEG, and a model fit on surrogate data will report
+confident probabilities on real brain signals that mean nothing. Training
+requires the real **Nieto "Thinking out loud"** dataset (OpenNeuro **ds003626**);
+the live loop requires real hardware.
 
 ---
 
@@ -22,36 +27,32 @@ pip install -r requirements.txt
 ```
 
 Core deps: numpy, scipy, scikit-learn, pyriemann, mne, joblib, matplotlib.
-(`mne` is only needed for the real dataset; the synthetic path runs without it.)
 
-## 2. Run it immediately (synthetic self-test)
-
-```bash
-python run.py --synthetic --task go      # binary speech-attempt vs rest (drives tVNS)
-python run.py --synthetic --task word    # 4-class direction decode
-```
-
-This generates structured surrogate EEG in which each subject carries a domain
-shift, then runs the full evaluation. You should see the **cross-subject** score
-rise sharply when alignment is on — confirming the pipeline and demonstrating
-why Riemannian Alignment matters:
+## 2. Get the dataset (required)
 
 ```bash
-python run.py --synthetic --task word --no-align   # ablation: alignment off
-```
-
-## 3. Run on the real dataset (ds003626)
-
-```bash
-# one-time download (~large):
 pip install openneuro-py
 openneuro-py download --dataset ds003626 --target-dir ds003626
+```
 
-# GO decoder, overt-speech-scaffolded (best for aphasia):
+Nothing in the pipeline runs without it — `run.py` requires `--data`, and
+`load_dataset` raises rather than falling back to generated data.
+
+## 3. Train the decoders
+
+```bash
+# GO decoder, overt-speech-scaffolded (best for aphasia) -- this gates tVNS:
 python run.py --data ./ds003626 --task go   --condition overt_scaffold
 
-# 4-class imagined-word decoder:
+# 4-class imagined-word decoder (tracking / display only):
 python run.py --data ./ds003626 --task word --condition inner
+```
+
+Ablation showing why Riemannian Alignment matters (cross-subject score should
+drop):
+
+```bash
+python run.py --data ./ds003626 --task word --no-align
 ```
 
 The loader reads the derivatives (`*_eeg-epo.fif` + `*_events.dat`),
@@ -104,17 +105,12 @@ gates tVNS on GO. It reuses the **same** shared preprocessing as training
 and remaps board channels onto the trained montage — so the covariance features
 online match what the model saw offline.
 
-Dry-run with **no hardware** (numpy stream — verifies the whole loop):
-
-```bash
-python acquisition.py --simulate --model outputs/model_go.joblib --duration 8
-```
-
-Live on an OpenBCI Cyton+Daisy (16 ch @ 125 Hz):
+Live on an OpenBCI Cyton+Daisy (16 ch @ 125 Hz). Real hardware is the only
+stream source — `--port` is required and there is no dry-run mode:
 
 ```bash
 pip install brainflow
-python acquisition.py --port /dev/ttyUSB0 --model outputs/model_go.joblib \
+python acquisition.py --port /dev/cu.usbserial-XXXX --model outputs/model_go.joblib \
     --channel-names "F7,F8,FC5,FC6,FT7,FT8,T7,T8,C3,C4,CP5,CP6,P7,P8,Cz,Pz"
 ```
 
@@ -138,12 +134,12 @@ each decode to a browser UI over a WebSocket.
 ```bash
 pip install "fastapi>=0.110,<0.120" "uvicorn>=0.27,<0.35" "websockets>=12"
 
-# Dry run, no hardware:
-python dashboard.py --simulate --model outputs/model_go.joblib
-
-# Live on OpenBCI Cyton+Daisy:
 python dashboard.py --port /dev/cu.usbserial-XXXX --model outputs/model_go.joblib
 ```
+
+Every trace it draws is measured from the board. Because there is no simulated
+source, an empty or flatlined chart always means a real acquisition problem
+(board off, port busy, electrodes not seated) — never synthetic filler.
 
 Open http://127.0.0.1:8765. Panels:
 
@@ -157,7 +153,7 @@ Open http://127.0.0.1:8765. Panels:
 | Latency | decision latency against the 300 ms pairing budget |
 
 The **word decode is display only**. It loads `outputs/model_word.joblib` (train
-with `python run.py --synthetic --task word`) and runs inside the dashboard's
+with `python run.py --data ./ds003626 --task word`) and runs inside the dashboard's
 observer callback -- *after* `run_loop` has already made its GO decision -- so it
 has no path back into the stimulation trigger (Invariant C). It is decoded only
 on GO frames, since word identity during rest is meaningless. Disable with
@@ -189,16 +185,21 @@ print(d.probability, d.latency_ms)
 
 ## 9. Honest caveats (read these)
 
-- **Synthetic ≠ real.** The synthetic backend verifies the code and illustrates
-  the alignment effect. Real imagined-speech accuracy is far lower and, per the
-  literature, multi-class imagined-word ID may sit near chance in patients —
+- **No synthetic anywhere.** There is no surrogate dataset and no simulated
+  stream, so every number and every trace comes from a real recording. The cost
+  is that you cannot exercise the pipeline without ds003626 and hardware; that
+  tradeoff is intentional.
+- **Imagined speech is hard.** Real imagined-speech accuracy is modest and, per
+  the literature, multi-class imagined-word ID may sit near chance in patients —
   which is exactly why the closed loop leans on the **binary GO decoder** plus
   overt scaffolding, not word ID, to time stimulation.
 - **Always read `metrics.json` against the permutation `null_mean`**, not against
   zero. A number above chance with a low p-value is the only thing that counts.
-- **GO "rest" on real data:** for a proper rest class, use the dataset's
-  `*_baseline-epo.fif` epochs. The current loader derives a rest surrogate when
-  true baseline epochs aren't wired in — swap in the baseline files for clinical
-  work (see the note in `data_loader._finalize_task`).
+- **GO "rest" is real baseline.** The rest class comes from the dataset's
+  `*_baseline-epo.fif` recordings, sliced into action-length windows and
+  subsampled per subject to match attempt counts. If those files are missing the
+  GO task raises — rest is never synthesized, because a rest class built from
+  scaled-down attempt epochs would be trivially separable and the GO score
+  meaningless.
 - **Label columns:** auto-detection is robust but verify the printed class
   distribution on your first real run; override in `_autodetect_columns` if needed.

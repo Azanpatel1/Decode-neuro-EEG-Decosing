@@ -106,7 +106,10 @@ def _windows_from_trial(trial: np.ndarray, cfg: Config) -> np.ndarray:
 def benchmark_latency(
     pipeline, ep, cfg: Config, max_trials: int = 60
 ) -> Dict:
-    """Measure decode-to-decision compute latency over simulated streaming.
+    """Measure decode-to-decision compute latency by replaying recorded epochs.
+
+    Windows are slid over real trials from `ep` -- no generated signal is involved;
+    this times the decode path, it does not fabricate input.
 
     Returns median / p95 / max latency (ms) and the fraction of decisions that
     land within cfg.latency_budget_ms -- i.e. inside the VNS pairing window.

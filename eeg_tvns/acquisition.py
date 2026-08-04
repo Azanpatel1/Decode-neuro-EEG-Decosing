@@ -8,17 +8,16 @@ Bridges a real-time EEG stream into the trained decoder and gates tVNS on GO:
       -> resample to the model's training rate
       -> RealTimeDecoder.decode(window)  -> GO gate -> fire_tvns()
 
-Two streamers share one interface:
-  * OpenBCIStreamer   - real OpenBCI Cyton+Daisy (16 ch) via BrainFlow.
-  * SimulatedStreamer - pure NumPy, no hardware: lets you exercise the whole
-                        closed loop (and this integrates cleanly into tests).
+The only stream source is real hardware (`OpenBCIStreamer`, Cyton+Daisy 16 ch via
+BrainFlow). There is deliberately no simulated/surrogate streamer: generated
+traces are indistinguishable from EEG on a monitor once they are on screen, and a
+stimulation loop must never be driven by, or demonstrated with, fabricated
+signals.
 
-Run live:
+Run:
     python -m eeg_tvns.acquisition --port /dev/ttyUSB0 --model outputs/model_go.joblib
-Dry-run with no hardware:
-    python -m eeg_tvns.acquisition --simulate --model outputs/model_go.joblib --duration 8
 
-Install for real hardware (same env as eeg_tvns):
+Install for hardware (same env as eeg_tvns):
     pip install brainflow
 """
 from __future__ import annotations
@@ -149,35 +148,6 @@ class OpenBCIStreamer(BaseStreamer):
 
 
 # ---------------------------------------------------------------------------
-# No-hardware simulator (for dry-runs and tests)
-# ---------------------------------------------------------------------------
-class SimulatedStreamer(BaseStreamer):
-    """Generate windows with alternating 'attempt-like' (high-power) and
-    'rest-like' (low-power) segments so the closed loop actually toggles GO."""
-
-    def __init__(self, cfg: Config, model_sfreq: float, n_channels: int,
-                 board_fs: float = 125.0, seed: int = 0):
-        super().__init__(cfg, model_sfreq, channel_order=None, resample=True)
-        self.board_fs = float(board_fs)
-        self.n_source_channels = n_channels
-        self._rng = np.random.default_rng(seed)
-        self._t0 = None
-
-    def _open(self):
-        self._t0 = time.perf_counter()
-
-    def _read_raw(self, win_samples: int) -> Optional[np.ndarray]:
-        # ~2 s attempt / 2 s rest cycle drives the GO gate up and down.
-        phase = (time.perf_counter() - self._t0) % 4.0
-        amp = 1.4 if phase < 2.0 else 0.4
-        x = self._rng.normal(0, amp, size=(self.n_source_channels, win_samples))
-        # add shared low-freq structure so band-pass leaves real content
-        t = np.arange(win_samples) / self.board_fs
-        x += 0.5 * amp * np.sin(2 * np.pi * 10 * t)[None, :]
-        return x
-
-
-# ---------------------------------------------------------------------------
 # Closed loop
 # ---------------------------------------------------------------------------
 def run_loop(
@@ -283,10 +253,8 @@ def main(argv=None):
                         format="%(asctime)s %(name)s %(levelname)s %(message)s",
                         datefmt="%H:%M:%S")
     ap = argparse.ArgumentParser(description="eeg_tvns live acquisition + closed loop")
-    src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--port", help="OpenBCI dongle serial port, e.g. /dev/ttyUSB0 or COM3")
-    src.add_argument("--simulate", action="store_true", help="no hardware: run the loop on a numpy stream")
-
+    ap.add_argument("--port", required=True,
+                    help="OpenBCI dongle serial port, e.g. /dev/cu.usbserial-XXXX or COM3")
     ap.add_argument("--model", default="outputs/model_go.joblib")
     ap.add_argument("--hop", type=float, default=None, help="seconds between decisions")
     ap.add_argument("--refractory", type=float, default=1.0, help="min seconds between tVNS fires")
@@ -305,14 +273,10 @@ def main(argv=None):
     board_names = [c.strip() for c in args.channel_names.split(",")] if args.channel_names else None
     channel_order = _resolve_channel_order(bundle, board_names)
 
-    if args.simulate:
-        n_ch = n_model_ch or cfg.n_synth_channels
-        streamer = SimulatedStreamer(cfg, model_sfreq, n_channels=n_ch)
-    else:
-        streamer = OpenBCIStreamer(
-            args.port, cfg, model_sfreq,
-            channel_order=channel_order, resample=not args.no_resample,
-        )
+    streamer = OpenBCIStreamer(
+        args.port, cfg, model_sfreq,
+        channel_order=channel_order, resample=not args.no_resample,
+    )
 
     with streamer:
         run_loop(streamer, decoder, fire_tvns, hop_s=hop,

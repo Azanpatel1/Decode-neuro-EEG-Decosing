@@ -3,11 +3,14 @@
 Runs the same closed-loop acquisition as `eeg_tvns.acquisition`, but publishes
 each frame (EEG window + Decision) to a browser dashboard over a WebSocket.
 
-    python -m eeg_tvns.dashboard --simulate --model outputs/model_go.joblib
     python -m eeg_tvns.dashboard --port /dev/cu.usbserial-XXXX \
         --model outputs/model_go.joblib
 
 Then open http://127.0.0.1:8765
+
+Everything shown is real recorded EEG from the board. There is no simulated
+source: on a strip chart, generated traces look exactly like brain activity, so
+the platform will not display anything it did not measure.
 
 The decode path is untouched: this only observes windows already produced by
 the streamer and downsamples them for display.
@@ -27,7 +30,6 @@ import numpy as np
 
 from .acquisition import (
     OpenBCIStreamer,
-    SimulatedStreamer,
     _resolve_channel_order,
     fire_tvns,
     load_decoder,
@@ -60,7 +62,7 @@ class FrameHub:
         display_sfreq: float,
         buffer_s: float = 6.0,
         history_n: int = 600,
-        source: str = "simulate",
+        source: str = "openbci",
         model_path: str = "",
         word_names: Optional[dict] = None,
         word_model_path: str = "",
@@ -529,7 +531,7 @@ function renderWord() {
     hero.className = 'word-hero idle';
     hero.textContent = 'no word model';
     bars.innerHTML = '';
-    note.textContent = 'Train one with: python run.py --synthetic --task word';
+    note.textContent = 'Train one with: python run.py --data ./ds003626 --task word';
     return;
   }
   const names = Object.keys(d.word_names || {})
@@ -747,7 +749,7 @@ def _load_word_readout(path: Optional[str], n_go_channels: Optional[int]) -> Opt
         return None
     if not os.path.exists(path):
         log.warning("word model %s not found -- word readout disabled. "
-                    "Train one with: python run.py --synthetic --task word", path)
+                    "Train one with: python run.py --data ./ds003626 --task word", path)
         return None
     try:
         w_bundle, w_cfg, w_decoder, _, w_n_ch = load_decoder(path)
@@ -765,10 +767,7 @@ def _load_word_readout(path: Optional[str], n_go_channels: Optional[int]) -> Opt
     return WordReadout(w_decoder, label_names)
 
 
-def _make_streamer(args, cfg: Config, model_sfreq: float, n_model_ch: int, channel_order):
-    if args.simulate:
-        n_ch = n_model_ch or cfg.n_synth_channels
-        return SimulatedStreamer(cfg, model_sfreq, n_channels=n_ch), "simulate"
+def _make_streamer(args, cfg: Config, model_sfreq: float, channel_order):
     return (
         OpenBCIStreamer(
             args.port, cfg, model_sfreq,
@@ -785,10 +784,8 @@ def main(argv=None) -> None:
         datefmt="%H:%M:%S",
     )
     ap = argparse.ArgumentParser(description="eeg_tvns live dashboard")
-    src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--port", help="OpenBCI dongle serial port")
-    src.add_argument("--simulate", action="store_true", help="no hardware")
-
+    ap.add_argument("--port", required=True,
+                    help="OpenBCI dongle serial port, e.g. /dev/cu.usbserial-XXXX")
     ap.add_argument("--model", default="outputs/model_go.joblib",
                     help="GO decoder -- the only model that gates tVNS")
     ap.add_argument("--word-model", default="outputs/model_word.joblib",
@@ -812,11 +809,16 @@ def main(argv=None) -> None:
     board_names = [c.strip() for c in args.channel_names.split(",")] if args.channel_names else None
     channel_order = _resolve_channel_order(bundle, board_names)
 
-    streamer, source = _make_streamer(args, cfg, model_sfreq, n_model_ch, channel_order)
+    streamer, source = _make_streamer(args, cfg, model_sfreq, channel_order)
 
     word_readout = _load_word_readout(args.word_model, n_model_ch)
 
-    ch_names = bundle.get("ch_names") or [f"CH{i+1}" for i in range(n_model_ch or cfg.n_synth_channels)]
+    ch_names = bundle.get("ch_names")
+    if not ch_names:
+        raise SystemExit(
+            f"Model {args.model!r} has no channel names. Retrain it so the live "
+            "board can be remapped onto the trained montage."
+        )
     hub = FrameHub(
         n_channels=len(ch_names),
         ch_names=ch_names,

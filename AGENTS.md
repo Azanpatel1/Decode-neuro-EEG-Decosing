@@ -31,6 +31,10 @@ Two decoders:
 
 Everything is open source: **pyRiemann · MNE · scikit-learn · BrainFlow**.
 
+**Real data only.** There is no synthetic dataset and no simulated stream — see
+Golden Constraint 5 and Invariant F. Training needs ds003626 on disk; the live
+loop needs an OpenBCI board. Both fail loudly when those are absent.
+
 ---
 
 ## 2. Golden constraints (the "why" behind decisions — respect these)
@@ -45,6 +49,13 @@ Everything is open source: **pyRiemann · MNE · scikit-learn · BrainFlow**.
    (transformers, foundation models, GPUs) to the *online* path.
 4. **Train/inference parity.** The features the model sees live must match those
    it trained on (see Invariant A below).
+5. **Real recorded data only.** The platform has no synthetic dataset generator
+   and no simulated stream, and must not regain one. Rationale: on a strip chart
+   generated traces are indistinguishable from EEG, and a model fit on surrogate
+   data emits confident probabilities that mean nothing about a real brain — both
+   are ways for a stimulation-gating system to look like it works when it does
+   not. If you need a fixture for tests, use a short real recording committed as
+   test data, never a generator (see Invariant F).
 
 ---
 
@@ -62,11 +73,11 @@ eeg_tvns_pipeline/
     ├── __init__.py       public API + version
     ├── config.py         Config dataclass — the single source of run settings
     ├── preprocessing.py  SHARED band-pass/notch/resample (train + live use this)
-    ├── data_loader.py    ds003626 loader + synthetic generator + montage select
+    ├── data_loader.py    ds003626 loader + montage select (real data only)
     ├── pipeline.py       Covariances → RiemannianAlignment → TangentSpace → clf
     ├── evaluate.py       leakage-free LOSO + within-subject + permutation chance
     ├── realtime.py       RealTimeDecoder (GO gate + online recentering) + latency
-    ├── acquisition.py    live streamers (OpenBCI + Simulated) + closed loop
+    ├── acquisition.py    live OpenBCI streamer + closed loop (no simulator)
     └── dashboard.py      FastAPI/WebSocket live monitor (observes run_loop only)
 ```
 
@@ -115,6 +126,14 @@ on mismatch. Preserve that warning.
 the online path, re-run the latency benchmark and confirm it stays well under
 `Config.latency_budget_ms`.
 
+**F. No fabricated signals, anywhere.** `load_dataset` raises when `cfg.data_root`
+is unset, and `OpenBCIStreamer` is the only streamer. Do not reintroduce a
+`make_synthetic`, a `SimulatedStreamer`, a `--synthetic`/`--simulate` flag, or an
+inline `rng.normal(...)` fallback for a missing window — not even "just for the
+demo" or "just for tests". If a code path cannot run without data or hardware, it
+must fail loudly with an actionable message instead of producing numbers. The
+corollary: an empty dashboard is a *correct* dashboard when nothing is connected.
+
 ---
 
 ## 5. Environment setup (important for Cursor)
@@ -141,38 +160,56 @@ Optional extras (only when needed):
 
 ---
 
-## 6. How to run & verify (no data or hardware required)
+## 6. How to run & verify
+
+Everything requires real data; the offline half needs no hardware. **Get the
+dataset first** — without it nothing runs, by design (Invariant F):
 
 ```bash
-# 1. Train the GO decoder on synthetic EEG (also self-tests the pipeline)
-python run.py --synthetic --task go
+pip install openneuro-py
+openneuro-py download --dataset ds003626 --target-dir ds003626
+```
+
+```bash
+# 1. Train the GO decoder (this is what gates tVNS)
+python run.py --data ./ds003626 --task go --condition overt_scaffold
 #    -> writes outputs/model_go.joblib, metrics.json, confusion_matrix.png, latency_hist.png
 
-# 2. Run the closed loop with NO hardware (numpy stream)
-python acquisition.py --simulate --model outputs/model_go.joblib --duration 8
+# 2. 4-class word decoder (display/tracking only)
+python run.py --data ./ds003626 --task word --condition inner
+
+# 3. Ablation: alignment matters (cross-subject score should drop with --no-align)
+python run.py --data ./ds003626 --task word --no-align
+
+# 4. Live closed loop -- requires the Cyton powered on and the OpenBCI GUI closed
+python acquisition.py --port /dev/cu.usbserial-XXXX --model outputs/model_go.joblib --duration 8
 #    -> logs p_go, latency, GO, and ">>> tVNS FIRE" events
-
-# 3. 4-class word decoder
-python run.py --synthetic --task word
-
-# 4. Ablation: alignment matters (cross-subject score should drop with --no-align)
-python run.py --synthetic --task word --no-align
 
 # 5. Live browser dashboard (traces + p_go + word readout + trigger window)
 pip install "fastapi>=0.110,<0.120" "uvicorn>=0.27,<0.35" "websockets>=12"
-python run.py --synthetic --task word            # word readout needs model_word.joblib
-python dashboard.py --simulate --model outputs/model_go.joblib  # then open http://127.0.0.1:8765
+python dashboard.py --port /dev/cu.usbserial-XXXX --model outputs/model_go.joblib
+#    -> open http://127.0.0.1:8765
 ```
 
-**Expected sanity signals:** synthetic runs finish in ~1–1.5 min; permutation
-`observed` sits well above `null_mean` with a low `p_value`; online latency is
-single-digit milliseconds (far under the 300 ms budget); in the simulate loop,
-`p_go` toggles high/low on the ~2 s attempt/rest cycle and tVNS fires with the
-refractory respected.
+**Expected sanity signals:** permutation `observed` sits well above `null_mean`
+with a low `p_value` (report nothing without this comparison); online latency is
+single-digit milliseconds, far under the 300 ms budget; on the live loop, `p_go`
+tracks actual speech attempts and tVNS fires with the refractory respected.
+
+**Verifying without data or hardware** — you can still check that the code
+imports, the CLIs parse, and the guardrails hold. These must all fail loudly
+rather than invent data:
+
+```bash
+python -c "import eeg_tvns; print(eeg_tvns.__version__)"
+python run.py --task go            # must exit: --data is required
+python dashboard.py                # must exit: --port is required
+```
 
 There is no formal test suite yet (see task T5). Until then, the commands above
-are the acceptance smoke test — **run them after any change** and confirm the
-signals above still hold.
+are the acceptance smoke test — **run what your change touches** and confirm the
+signals above still hold. Do not add a synthetic mode to make the smoke test
+easier to run.
 
 ---
 
@@ -185,11 +222,13 @@ fast, non-blocking call — it runs inside the loop and must not blow the latenc
 budget. *Accept when:* a real or mocked trigger fires on GO and the loop's median
 latency stays < `Config.latency_budget_ms`.
 
-**T2 — Wire true "rest" epochs for the GO decoder on real data.**
-Location: `data_loader._finalize_task` (see the note there). The dataset ships
-`*_baseline-epo.fif` files; use those as the rest class instead of the current
-low-power surrogate. *Accept when:* `--data ./ds003626 --task go` builds the GO
-problem from real baseline epochs and prints a balanced rest/attempt count.
+**T2 — DONE. True "rest" epochs for the GO decoder.**
+`data_loader._build_rest_from_baseline` builds the rest class from the dataset's
+`*_baseline-epo.fif` recordings, sliced into action-length windows and subsampled
+per subject to match attempt counts; `_finalize_task` raises if rest is absent.
+The old low-power surrogate is gone and must not come back (Invariant F). Still
+worth verifying against real data: confirm the printed attempt/rest counts are
+balanced and that GO LOSO beats its permutation baseline.
 
 **T3 — Add stimulation control arms.**
 Add `paired` (current behavior), `unpaired/delayed`, and `sham` modes to
@@ -200,14 +239,17 @@ specific. *Accept when:* a `--mode {paired,delayed,sham}` flag changes when/if
 **T4 — Optional: train at the board's native rate.**
 125 Hz board vs. 256 Hz model currently reconciled by online resampling. Add a
 path to calibrate/train a model at `Config.sfreq = 125` for the cleanest match.
-*Accept when:* a 125 Hz model runs in `--simulate` with `--no-resample` and
-matching window sizes.
+*Accept when:* a 125 Hz model runs live with `--no-resample` and matching window
+sizes.
 
 **T5 — Add a pytest suite.**
 Cover: preprocessing parity (offline vs. online filter output identical for the
-same input), alignment improves cross-subject score on synthetic, latency under
-budget, and the simulate loop fires at least once. *Accept when:* `pytest` passes
-locally with no network/hardware.
+same input), latency under budget, `load_dataset` raising without `--data`, and
+both CLIs rejecting a missing `--port`/`--data`. Fixtures must be either a small
+**real** recording committed as test data or a recorded window replayed from disk
+— never a generator (Invariant F). Accuracy/alignment tests need real epochs, so
+scope them to a checked-in subject subset or mark them as requiring ds003626.
+*Accept when:* `pytest` passes locally with no network or hardware.
 
 When you pick up a task, keep changes scoped to it and re-run the section-6 smoke
 test before declaring done.
@@ -223,7 +265,7 @@ test before declaring done.
   new knobs there with a sensible default and document them; don't scatter magic
   numbers.
 - New heavy or optional dependencies go in `requirements.txt` **commented** unless
-  they're needed for the core offline+synthetic path.
+  they're needed for the core offline training path.
 - Keep the online path (`realtime.py`, `acquisition.process_window`) allocation-
   light and free of heavyweight models.
 
@@ -239,6 +281,10 @@ test before declaring done.
 - Don't put transformers/RNNs/foundation models/GPU inference in the online path
   (Golden Constraint 3). They're fine as *offline* research comparisons.
 - Don't claim an accuracy number without its permutation chance baseline.
+- Don't reintroduce synthetic data or a simulated stream in any form — no
+  `make_synthetic`, no `SimulatedStreamer`, no `--synthetic`/`--simulate`, no
+  random-noise fallback for a missing window or a missing dataset (Invariant F /
+  Golden Constraint 5). Prefer a loud failure over a plausible-looking trace.
 
 ---
 

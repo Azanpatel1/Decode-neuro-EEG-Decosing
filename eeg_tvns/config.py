@@ -33,8 +33,10 @@ LOW_DENSITY_MONTAGE: List[str] = [
 @dataclass
 class Config:
     # --- data source -------------------------------------------------------
-    data_root: Optional[str] = None      # path to ds003626 (BIDS). None -> synthetic.
-    subjects: Optional[List[int]] = None  # e.g. [1,2,3]; None -> all found / all synthetic
+    # Path to the ds003626 (BIDS) root. Required: there is no synthetic backend,
+    # so load_dataset() raises when this is unset.
+    data_root: Optional[str] = None
+    subjects: Optional[List[int]] = None  # e.g. [1,2,3]; None -> all found
     sfreq: float = 256.0                  # target sampling rate (Hz)
 
     # --- task --------------------------------------------------------------
@@ -55,7 +57,6 @@ class Config:
 
     # --- montage -----------------------------------------------------------
     use_low_density: bool = True          # emulate wearable montage (recommended)
-    n_synth_channels: int = 16            # channels for synthetic data
 
     # --- model -------------------------------------------------------------
     cov_estimator: str = "oas"            # regularised covariance (good for short/low-ch)

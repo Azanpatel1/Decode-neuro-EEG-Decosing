@@ -1,18 +1,18 @@
 """Data loading for the eeg_tvns pipeline.
 
-Two backends, one interface:
+Real recorded EEG only:
 
   * load_inner_speech(...)  -> reads the Nieto "Thinking out loud" derivatives
                                (OpenNeuro ds003626) from disk.
-  * make_synthetic(...)     -> generates structured surrogate EEG so the whole
-                               pipeline runs, self-tests, and demonstrates that
-                               Riemannian Alignment helps -- with no download.
+  * load_dataset(cfg)       -> entry point; requires cfg.data_root and raises if
+                               it is missing. There is no surrogate fallback --
+                               a decoder that gates stimulation must be fit on
+                               real recordings.
 
-Both return an `Epochs` object: X (trials, channels, samples), integer labels y,
-per-trial subject ids (domains), and metadata. `load_dataset(cfg)` dispatches on
-whether cfg.data_root is set.
+Returns an `Epochs` object: X (trials, channels, samples), integer labels y,
+per-trial subject ids (domains), and metadata.
 
-The real loader is deliberately defensive: BioSemi/derivative label columns vary
+The loader is deliberately defensive: BioSemi/derivative label columns vary
 between releases, so it AUTO-DETECTS which column of `*_events.dat` is the word
 class ({0,1,2,3}) and which is the condition ({0,1,2}), and prints the label
 distribution so you can verify correctness on the first run.
@@ -120,7 +120,11 @@ def _preprocess_array(
 # Real dataset: Nieto "Thinking out loud" (OpenNeuro ds003626)
 # ---------------------------------------------------------------------------
 def _find_subject_files(data_root: str) -> dict:
-    """Map subject id -> list of (eeg_fif, events_dat) session pairs."""
+    """Map subject id -> list of (eeg_fif, events_dat, baseline_fif|None) sessions.
+
+    `baseline_fif` is the session's `*_baseline-epo.fif` recording, used as the
+    true rest class for the GO task. It is None when the release does not ship it.
+    """
     patt = os.path.join(
         data_root, "derivatives", "sub-*", "ses-*", "*_eeg-epo.fif"
     )
@@ -135,6 +139,9 @@ def _find_subject_files(data_root: str) -> dict:
         if not os.path.exists(ev):
             log.warning("No events file for %s; skipping.", f)
             continue
+        baseline = base + "_baseline-epo.fif"
+        if not os.path.exists(baseline):
+            baseline = None
         # subject id from 'sub-XX'
         sid = None
         for part in f.split(os.sep):
@@ -144,8 +151,19 @@ def _find_subject_files(data_root: str) -> dict:
                 except ValueError:
                     sid = part
                 break
-        out.setdefault(sid, []).append((f, ev))
+        out.setdefault(sid, []).append((f, ev, baseline))
     return out
+
+
+def _slice_into_windows(epoch_data: np.ndarray, n_samp: int) -> List[np.ndarray]:
+    """Cut a (channels, samples) recording into consecutive `n_samp` windows.
+
+    Used to turn each long baseline recording into rest trials the same length as
+    the action epochs. Any remainder shorter than one window is dropped rather
+    than padded -- padding would invent samples.
+    """
+    n_win = epoch_data.shape[1] // n_samp
+    return [epoch_data[:, w * n_samp:(w + 1) * n_samp] for w in range(n_win)]
 
 
 def _load_events(path: str) -> np.ndarray:
@@ -208,9 +226,13 @@ def load_inner_speech(cfg: Config) -> Epochs:
 
     Xs, ys, subs, conds = [], [], [], []
     ch_names_ref: Optional[List[str]] = None
+    # Raw baseline recordings per session, kept unsliced until the action-window
+    # length is known. Only collected for the GO task, which needs a rest class.
+    baseline_raw: List[Tuple[object, np.ndarray]] = []
+    sessions_missing_baseline: List[str] = []
 
     for sid in wanted_subjects:
-        for fif, ev in subj_files.get(sid, []):
+        for fif, ev, baseline_fif in subj_files.get(sid, []):
             ep = mne.read_epochs(fif, preload=True, verbose="ERROR")
             ep.pick("eeg")
             if abs(ep.info["sfreq"] - cfg.sfreq) > 1e-3:
@@ -244,21 +266,115 @@ def load_inner_speech(cfg: Config) -> Epochs:
             subs.append(np.full(mask.sum(), sid if isinstance(sid, int) else 0))
             ch_names_ref = ch_names_ref or ch_names
 
+            if cfg.task == "go":
+                if baseline_fif is None:
+                    sessions_missing_baseline.append(fif)
+                else:
+                    bep = mne.read_epochs(baseline_fif, preload=True, verbose="ERROR")
+                    bep.pick("eeg")
+                    if abs(bep.info["sfreq"] - cfg.sfreq) > 1e-3:
+                        bep.resample(cfg.sfreq, verbose="ERROR")
+                    baseline_raw.append((sid, bep.get_data(copy=True)))
+
     X = np.concatenate(Xs, axis=0)
     y_class = np.concatenate(ys, axis=0)
     subjects = np.concatenate(subs, axis=0)
     condition = np.concatenate(conds, axis=0)
 
+    rest_X = rest_subjects = None
+    if cfg.task == "go":
+        rest_X, rest_subjects = _build_rest_from_baseline(
+            baseline_raw, sessions_missing_baseline,
+            n_samp=X.shape[2], n_channels=X.shape[1],
+            attempt_subjects=subjects, cfg=cfg,
+        )
+        rest_X = _preprocess_array(rest_X, cfg.sfreq, cfg)
+
     X = _preprocess_array(X, cfg.sfreq, cfg)
 
     if cfg.use_low_density:
-        X, ch_names_ref = select_montage(X, ch_names_ref, LOW_DENSITY_MONTAGE)
+        full_ch_names = list(ch_names_ref or [])
+        X, ch_names_ref = select_montage(X, full_ch_names, LOW_DENSITY_MONTAGE)
+        if rest_X is not None:
+            rest_X, _ = select_montage(rest_X, full_ch_names, LOW_DENSITY_MONTAGE)
 
-    return _finalize_task(X, y_class, subjects, condition, cfg, cfg.sfreq, ch_names_ref)
+    return _finalize_task(
+        X, y_class, subjects, condition, cfg, cfg.sfreq, ch_names_ref,
+        rest_X=rest_X, rest_subjects=rest_subjects,
+    )
+
+
+def _build_rest_from_baseline(
+    baseline_raw: List[Tuple[object, np.ndarray]],
+    sessions_missing_baseline: List[str],
+    n_samp: int,
+    n_channels: int,
+    attempt_subjects: np.ndarray,
+    cfg: Config,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Build the GO task's rest class from real `*_baseline-epo.fif` recordings.
+
+    Each baseline recording is cut into windows the same length as the action
+    epochs, then subsampled per subject to roughly match that subject's attempt
+    count so the classifier is not fed a lopsided problem. Subsampling only ever
+    *drops* real windows.
+
+    Raises if no baseline data is available: the GO decoder gates stimulation, so
+    a missing rest class must stop the run rather than be filled in.
+    """
+    if sessions_missing_baseline:
+        log.warning(
+            "%d session(s) have no '*_baseline-epo.fif'; their rest trials are "
+            "absent (first: %s).",
+            len(sessions_missing_baseline), sessions_missing_baseline[0],
+        )
+    if not baseline_raw:
+        raise FileNotFoundError(
+            "The GO task needs real rest epochs, but no '*_baseline-epo.fif' files "
+            "were found in the dataset. Re-download ds003626 including its "
+            "derivatives, or run the word task instead (--task word). Rest will "
+            "not be synthesized."
+        )
+
+    rng = np.random.default_rng(cfg.random_state)
+    windows: List[np.ndarray] = []
+    subs: List[int] = []
+    for sid, bdata in baseline_raw:
+        sid_int = sid if isinstance(sid, int) else 0
+        subj_windows: List[np.ndarray] = []
+        for epoch_data in bdata:  # (channels, samples)
+            subj_windows.extend(_slice_into_windows(epoch_data, n_samp))
+        if not subj_windows:
+            log.warning("sub-%s: baseline shorter than one %d-sample window; "
+                        "no rest trials from it.", sid, n_samp)
+            continue
+        # Cap at this subject's attempt count to keep the classes comparable.
+        n_attempts = int(np.sum(attempt_subjects == sid_int))
+        if n_attempts and len(subj_windows) > n_attempts:
+            pick = rng.choice(len(subj_windows), size=n_attempts, replace=False)
+            subj_windows = [subj_windows[i] for i in sorted(pick)]
+        windows.extend(subj_windows)
+        subs.extend([sid_int] * len(subj_windows))
+
+    if not windows:
+        raise ValueError(
+            f"No baseline window is as long as the {n_samp}-sample action window. "
+            "Shorten the action window (Config.tmin/tmax) so real rest epochs fit."
+        )
+
+    rest_X = np.stack(windows).astype(np.float64)
+    if rest_X.shape[1] != n_channels:
+        raise ValueError(
+            f"Baseline recordings have {rest_X.shape[1]} channels but action epochs "
+            f"have {n_channels}. Refusing to guess a mapping."
+        )
+    log.info("GO rest class: %d real baseline windows from %d session(s).",
+             len(rest_X), len(baseline_raw))
+    return rest_X, np.asarray(subs, int)
 
 
 # ---------------------------------------------------------------------------
-# Task assembly (shared by real + synthetic)
+# Task assembly
 # ---------------------------------------------------------------------------
 def _finalize_task(
     X: np.ndarray,
@@ -280,19 +396,19 @@ def _finalize_task(
         )
 
     # task == "go": binary attempt (any word) vs rest.
-    if rest_X is None:
-        # Derive a rest surrogate from the pre-action baseline of each trial is
-        # unavailable here (we cropped); instead build rest from a low-power
-        # temporal shuffle so the loader always yields a usable GO problem.
-        # NOTE: for the real dataset prefer the '*_baseline-epo.fif' files
-        # (see load_inner_speech docstring / README) as true rest.
-        rng = np.random.default_rng(cfg.random_state)
-        rest_X = X * 0.4 + rng.normal(0, X.std() * 0.4, size=X.shape)
-        rest_subjects = subjects.copy()
+    # Rest must be real recorded baseline (see _build_rest_from_baseline). There is
+    # no surrogate fallback: this decoder gates stimulation, and a rest class made
+    # of scaled-down attempt epochs would make the GO score meaningless.
+    if rest_X is None or rest_subjects is None:
+        raise ValueError(
+            "The GO task requires real rest epochs, but none were supplied. "
+            "Rest is never synthesized -- see _build_rest_from_baseline."
+        )
 
     Xg = np.concatenate([X, rest_X], axis=0)
     yg = np.concatenate([np.ones(len(X), int), np.zeros(len(rest_X), int)])
     sg = np.concatenate([subjects, rest_subjects])
+    log.info("GO task: %d attempt vs %d rest trials.", len(X), len(rest_X))
     return Epochs(
         X=Xg, y=yg, subjects=sg, sfreq=sfreq, ch_names=ch_names,
         label_names={0: "rest", 1: "attempt"},
@@ -300,79 +416,30 @@ def _finalize_task(
 
 
 # ---------------------------------------------------------------------------
-# Synthetic backend
-# ---------------------------------------------------------------------------
-def _random_spd(rng: np.random.Generator, n: int, scale: float = 1.0) -> np.ndarray:
-    A = rng.normal(0, 1, size=(n, n))
-    return scale * (A @ A.T / n) + np.eye(n) * 0.05
-
-
-def _sqrtm_sym(M: np.ndarray) -> np.ndarray:
-    w, V = np.linalg.eigh(M)
-    return (V * np.sqrt(np.clip(w, 1e-9, None))) @ V.T
-
-
-def make_synthetic(cfg: Config, n_subjects: int = 5, trials_per_class: int = 35) -> Epochs:
-    """Generate structured surrogate EEG.
-
-    Each word class has a distinct spatial covariance; each *subject* applies a
-    congruence transform (a domain shift). This is exactly the setting where
-    Riemannian Alignment helps -- recentering each subject removes the shift and
-    makes classes line up across subjects, which the smoke test verifies.
-    """
-    rng = np.random.default_rng(cfg.random_state)
-    nch = cfg.n_synth_channels
-    nsamp = int(round((cfg.tmax - cfg.tmin) * cfg.sfreq))
-    n_classes = 4
-
-    # Subtle, shared-base class covariances: a common base plus a small
-    # class-specific perturbation. This makes the class signal WEAK relative to
-    # the per-subject domain shift below -- so without alignment the shift
-    # swamps the classes (LOSO near chance) and Riemannian Alignment recovers
-    # them. That contrast is what the smoke test is meant to reveal.
-    base = _random_spd(rng, nch, scale=1.0)
-    class_cov = [base + _random_spd(rng, nch, scale=0.25) for _ in range(n_classes)]
-    rest_cov = _random_spd(rng, nch, scale=0.35)  # lower-power "rest"
-    # Strong, varied per-subject congruence transforms (the domain shift).
-    subj_shift = [_sqrtm_sym(_random_spd(rng, nch, scale=2.5)) for _ in range(n_subjects)]
-
-    def sample(cov: np.ndarray, T: np.ndarray) -> np.ndarray:
-        eff = T @ cov @ T.T
-        L = _sqrtm_sym(eff)
-        return (L @ rng.normal(0, 1, size=(nch, nsamp)))
-
-    Xs, ys, subs = [], [], []
-    restXs, rest_subs = [], []
-    for s in range(n_subjects):
-        T = subj_shift[s]
-        for k in range(n_classes):
-            for _ in range(trials_per_class):
-                Xs.append(sample(class_cov[k], T)); ys.append(k); subs.append(s)
-        for _ in range(trials_per_class * 2):  # rest pool for GO task
-            restXs.append(sample(rest_cov, T)); rest_subs.append(s)
-
-    X = np.stack(Xs).astype(np.float64)
-    y_class = np.asarray(ys, int)
-    subjects = np.asarray(subs, int)
-    ch_names = [f"CH{i+1}" for i in range(nch)]
-
-    return _finalize_task(
-        X, y_class, subjects, None, cfg, cfg.sfreq, ch_names,
-        rest_X=np.stack(restXs).astype(np.float64),
-        rest_subjects=np.asarray(rest_subs, int),
-    )
-
-
-# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 def load_dataset(cfg: Config) -> Epochs:
+    """Load real recorded EEG. There is no surrogate/synthetic fallback.
+
+    A decoder that gates stimulation must be fit on real recordings, so a missing
+    dataset is a hard error rather than something quietly filled in with
+    generated data.
+    """
     cfg.validate()
-    if cfg.data_root:
-        log.info("Loading real dataset (ds003626) from %s", cfg.data_root)
-        ep = load_inner_speech(cfg)
-    else:
-        log.info("No --data given: generating synthetic dataset for self-test.")
-        ep = make_synthetic(cfg)
+    if not cfg.data_root:
+        raise ValueError(
+            "No dataset given. This pipeline only runs on real recorded EEG.\n"
+            "Pass --data /path/to/ds003626 (Nieto 'Thinking out loud').\n"
+            "To fetch it:\n"
+            "    pip install openneuro-py\n"
+            "    openneuro-py download --dataset ds003626 --target-dir ds003626"
+        )
+    if not os.path.isdir(cfg.data_root):
+        raise FileNotFoundError(
+            f"Dataset directory not found: {cfg.data_root!r}. "
+            "Point --data at the ds003626 root."
+        )
+    log.info("Loading real dataset (ds003626) from %s", cfg.data_root)
+    ep = load_inner_speech(cfg)
     log.info(ep.summary())
     return ep

@@ -3,3 +3,6 @@ outputs/
 __pycache__/
 *.pyc
 .DS_Store
+
+# real EEG datasets are large; fetch with openneuro-py, never commit
+ds003626/

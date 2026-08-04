@@ -1,16 +1,19 @@
 """
 eeg_tvns — Riemannian EEG decoding pipeline for closed-loop tVNS speech rehabilitation.
 
+Operates on real recorded EEG only -- there is no synthetic data backend and no
+simulated stream source.
+
 Public API:
     from eeg_tvns import (
-        load_dataset, make_synthetic, LOW_DENSITY_MONTAGE,
+        load_dataset, LOW_DENSITY_MONTAGE,
         build_pipeline, RiemannianAlignment,
         evaluate_cross_subject, evaluate_within_subject, permutation_chance,
         RealTimeDecoder, benchmark_latency,
     )
 """
 from .config import Config, LOW_DENSITY_MONTAGE
-from .data_loader import load_dataset, load_inner_speech, make_synthetic, Epochs
+from .data_loader import load_dataset, load_inner_speech, Epochs
 from .pipeline import build_pipeline, RiemannianAlignment
 from .evaluate import (
     evaluate_cross_subject,
@@ -22,7 +25,6 @@ from .preprocessing import preprocess, design_filters, apply_filters, resample_w
 from .acquisition import (
     BaseStreamer,
     OpenBCIStreamer,
-    SimulatedStreamer,
     run_loop,
     load_decoder,
 )
@@ -34,7 +36,6 @@ __all__ = [
     "LOW_DENSITY_MONTAGE",
     "load_dataset",
     "load_inner_speech",
-    "make_synthetic",
     "Epochs",
     "build_pipeline",
     "RiemannianAlignment",
@@ -49,7 +50,6 @@ __all__ = [
     "resample_window",
     "BaseStreamer",
     "OpenBCIStreamer",
-    "SimulatedStreamer",
     "run_loop",
     "load_decoder",
 ]

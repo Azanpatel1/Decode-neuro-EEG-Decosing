@@ -3,16 +3,16 @@
 Decode Neuro -- closed-loop tVNS speech-rehab EEG decoder.
 End-to-end runner: load -> evaluate (leakage-free) -> fit -> save -> latency.
 
-Quick start (no data needed -- runs on synthetic EEG and self-tests):
+Trains on real recorded EEG only (Nieto "Thinking out loud", OpenNeuro ds003626).
+There is no synthetic backend: a decoder that gates stimulation must be fit on
+real recordings, and its reported accuracy must mean something.
 
     pip install -r requirements.txt
-    python run.py --synthetic --task go
-    python run.py --synthetic --task word
 
-On the real dataset (Nieto "Thinking out loud", OpenNeuro ds003626):
+    # get the data once:
+    pip install openneuro-py
+    openneuro-py download --dataset ds003626 --target-dir ds003626
 
-    # get the data once, e.g.:
-    #   pip install openneuro-py && openneuro-py download --dataset ds003626 --target-dir ds003626
     python run.py --data ./ds003626 --task go   --condition overt_scaffold
     python run.py --data ./ds003626 --task word --condition inner
 
@@ -40,10 +40,8 @@ from eeg_tvns.realtime import benchmark_latency
 
 def parse_args() -> Config:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    src = p.add_mutually_exclusive_group()
-    src.add_argument("--data", default=None, help="path to ds003626 root (BIDS). Omit for synthetic.")
-    src.add_argument("--synthetic", action="store_true", help="use synthetic EEG (default if no --data).")
-
+    p.add_argument("--data", required=True,
+                   help="path to the ds003626 root (BIDS) of real recorded EEG.")
     p.add_argument("--task", choices=["go", "word"], default="go",
                    help="'go' = binary speech-attempt vs rest (drives tVNS); 'word' = 4-class.")
     p.add_argument("--condition", choices=["inner", "pronounced", "visualized", "overt_scaffold"],
