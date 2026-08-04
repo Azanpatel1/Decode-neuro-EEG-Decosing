@@ -3,17 +3,25 @@
 Decode Neuro -- closed-loop tVNS speech-rehab EEG decoder.
 End-to-end runner: load -> evaluate (leakage-free) -> fit -> save -> latency.
 
-Trains on real recorded EEG only (Nieto "Thinking out loud", OpenNeuro ds003626).
-There is no synthetic backend: a decoder that gates stimulation must be fit on
-real recordings, and its reported accuracy must mean something.
+Trains on real recorded EEG only. There is no synthetic backend: a decoder that
+gates stimulation must be fit on real recordings, and its accuracy must mean
+something.
+
+Two sources:
+
+  --calibration   your own same-session recordings from calibrate.py. Use this
+                  for --task go. Attempt and rest are interleaved in one
+                  recording, so the score reflects speech attempt.
+  --data          the ds003626 (BIDS) root. Fine for --task word, but its only
+                  rest is a separate baseline block, which confounds --task go
+                  (0.80 vs 0.54 at a matched window; see README).
 
     pip install -r requirements.txt
 
-    # get the data once:
-    pip install openneuro-py
-    openneuro-py download --dataset ds003626 --target-dir ds003626
+    python calibrate.py --port <serial> --subject 1 --channel-names ...
+    python run.py --calibration 'calib/*.npz' --task go
 
-    python run.py --data ./ds003626 --task go   --condition overt_scaffold
+    openneuro-py download --dataset ds003626 --target-dir ds003626
     python run.py --data ./ds003626 --task word --condition inner
 
 Outputs (in ./outputs), suffixed per task: model_<task>.joblib,
@@ -41,8 +49,13 @@ from eeg_tvns.realtime import benchmark_latency
 
 def parse_args() -> Config:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--data", required=True,
-                   help="path to the ds003626 root (BIDS) of real recorded EEG.")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--data", default=None,
+                    help="path to the ds003626 root (BIDS) of real recorded EEG.")
+    src.add_argument("--calibration", default=None,
+                    help="glob of same-session recordings from calibrate.py, e.g. "
+                         "'calib/*.npz'. Preferred for --task go: ds003626's rest "
+                         "is a separate baseline block and confounds that score.")
     p.add_argument("--task", choices=["go", "word"], default="go",
                    help="'go' = binary speech-attempt vs rest (drives tVNS); 'word' = 4-class.")
     p.add_argument("--condition", choices=["inner", "pronounced", "visualized", "overt_scaffold"],
@@ -62,6 +75,7 @@ def parse_args() -> Config:
 
     cfg = Config(
         data_root=a.data,
+        calibration_glob=a.calibration,
         subjects=a.subjects,
         task=a.task,
         condition=a.condition,

@@ -28,24 +28,61 @@ pip install -r requirements.txt
 
 Core deps: numpy, scipy, scikit-learn, pyriemann, mne, joblib, matplotlib.
 
-## 2. Get the dataset (required)
+## 2. Pick a data source
+
+Two sources, and **which one you use matters for the GO decoder**:
+
+| Source | Flag | Use for |
+|---|---|---|
+| Your own same-session recording | `--calibration` | **the GO decoder** (gates tVNS) |
+| ds003626 (public) | `--data` | the word decoder, and offline research |
+
+The GO task on ds003626 is confounded — its only rest is a separate baseline
+block (see section 9). For a GO decoder you intend to actually gate stimulation
+with, record your own calibration data where rest is interleaved with attempts in
+one session.
+
+### 2a. Record your own calibration data (for the GO decoder)
+
+```bash
+pip install brainflow
+python calibrate.py --port /dev/cu.usbserial-XXXX --subject 1 \
+    --channel-names "F7,F8,FC5,FC6,FT7,FT8,T7,T8,C3,C4,CP5,CP6,P7,P8,Cz,Pz"
+```
+
+Cues ~40 overt speech attempts and ~40 rest trials, **randomly interleaved** (runs
+of the same cue are capped at 3) so slow drift cannot line up with class identity.
+Takes about 7 minutes. On `SPEAK ALOUD: <word>` say the word once; on `REST` sit
+still and silent. Samples are stored raw at the board's native rate, so the shared
+preprocessing applies at load time and the model trains at 125 Hz — which also
+means the online path needs no resampling (`--no-resample`).
+
+```bash
+python run.py --calibration 'calib/*.npz' --task go
+```
+
+One recording gives you the within-subject number; cross-subject LOSO needs
+several subjects.
+
+### 2b. Get ds003626 (for the word decoder)
 
 ```bash
 pip install openneuro-py
 openneuro-py download --dataset ds003626 --target-dir ds003626
 ```
 
-Nothing in the pipeline runs without it — `run.py` requires `--data`, and
-`load_dataset` raises rather than falling back to generated data.
+Only the `derivatives/` tree is needed (~7 GB). Nothing runs without a real
+source: `run.py` requires `--data` or `--calibration`, and `load_dataset` raises
+rather than falling back to generated data.
 
 ## 3. Train the decoders
 
 ```bash
-# GO decoder, overt-speech-scaffolded (best for aphasia) -- this gates tVNS:
-python run.py --data ./ds003626 --task go   --condition overt_scaffold
-
 # 4-class imagined-word decoder (tracking / display only):
 python run.py --data ./ds003626 --task word --condition inner
+
+# GO decoder from ds003626 -- offline research only, see the caveat in section 9:
+python run.py --data ./ds003626 --task go --condition overt_scaffold
 ```
 
 Ablation showing why Riemannian Alignment matters (cross-subject score should
@@ -54,6 +91,20 @@ drop):
 ```bash
 python run.py --data ./ds003626 --task word --no-align
 ```
+
+### What the real data actually gives you
+
+Measured here on ds003626, leakage-free (LOSO, 10 subjects, 16-channel
+low-density montage), with permutation baselines:
+
+| Decoder | LOSO balanced acc | Chance | Permutation | Verdict |
+|---|---|---|---|---|
+| Word (4-class, inner) | 0.266 | 0.250 | p = 0.50 | **at chance** |
+| GO (baseline-block rest) | 0.920 | 0.500 | p = 0.005 | **confounded, see §9** |
+
+Neither is currently a working decoder. The word result matches the literature on
+imagined-word identity and is exactly why the word decoder never gates
+stimulation (Invariant C). The GO result is a block artifact, not a decoder.
 
 The loader reads the derivatives (`*_eeg-epo.fif` + `*_events.dat`),
 **auto-detects** which label column is the word class ({0,1,2,3}) and which is
@@ -211,8 +262,13 @@ print(d.probability, d.latency_ms)
 
   So the headline GO number (0.92 at a 2.5 s window) mostly reflects *which block
   a window came from*. Online, rest is same-block rest, where this pipeline sits
-  near chance. **Do not use a baseline-block GO model to gate stimulation.** For a
-  deployable gate, record calibration data on your own hardware with rest
-  interleaved into the same session as the attempts.
+  near chance. **Do not use a baseline-block GO model to gate stimulation.** Use
+  `calibrate.py` (section 2a) instead, which interleaves rest with attempts in one
+  session so both classes share block, impedance and arousal context.
+
+  Note that the **permutation test does not catch this**: it shuffles labels, so
+  it detects "is there any learnable structure" — and block identity *is*
+  learnable structure. Passing at p=0.005 says nothing about *what* was learned.
+  A same-block control is the check that matters.
 - **Label columns:** auto-detection is robust but verify the printed class
   distribution on your first real run; override in `_autodetect_columns` if needed.

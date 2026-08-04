@@ -33,9 +33,13 @@ LOW_DENSITY_MONTAGE: List[str] = [
 @dataclass
 class Config:
     # --- data source -------------------------------------------------------
-    # Path to the ds003626 (BIDS) root. Required: there is no synthetic backend,
-    # so load_dataset() raises when this is unset.
+    # Path to the ds003626 (BIDS) root. There is no synthetic backend, so
+    # load_dataset() raises unless this or `calibration_glob` is set.
     data_root: Optional[str] = None
+    # Glob for same-session calibration recordings written by calibrate.py. This
+    # is the source to prefer for the GO task: ds003626's rest is a separate
+    # baseline block, which confounds the GO score (see calibrate.py docstring).
+    calibration_glob: Optional[str] = None
     subjects: Optional[List[int]] = None  # e.g. [1,2,3]; None -> all found
     sfreq: float = 256.0                  # target sampling rate (Hz)
 

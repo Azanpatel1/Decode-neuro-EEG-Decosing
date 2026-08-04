@@ -588,6 +588,92 @@ def _finalize_task(
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
+def load_calibration(cfg: Config) -> Epochs:
+    """Load same-session calibration recordings written by `calibrate.py`.
+
+    This is the trustworthy source for the GO task: attempt and rest trials are
+    randomly interleaved inside one recording, so they share block, impedance and
+    arousal context. Contrast with ds003626, whose only rest is a separate
+    baseline block that confounds the GO score.
+
+    Recordings are stored raw at board rate; filtering happens here through the
+    shared `preprocessing` module, so calibration data and the live path get the
+    same filter design (Invariant A). `cfg.sfreq` is adopted from the recordings
+    so the model trains at the board's native rate and the online path needs no
+    resampling.
+    """
+    paths = sorted(glob.glob(cfg.calibration_glob or ""))
+    if not paths:
+        raise FileNotFoundError(
+            f"No calibration recordings matched {cfg.calibration_glob!r}. "
+            "Record some first:\n"
+            "    python calibrate.py --port <serial> --subject 1 --channel-names ..."
+        )
+
+    Xs, y_go, y_word, subs = [], [], [], []
+    sfreq = ch_names = action_s = None
+    for p in paths:
+        with np.load(p, allow_pickle=True) as z:
+            names = [str(c) for c in z["ch_names"]]
+            fs = float(z["sfreq"])
+            if sfreq is None:
+                sfreq, ch_names, action_s = fs, names, float(z["action_s"])
+            if fs != sfreq:
+                raise ValueError(
+                    f"{os.path.basename(p)} was recorded at {fs} Hz but earlier "
+                    f"files at {sfreq} Hz. Refusing to mix sampling rates."
+                )
+            if names != ch_names:
+                raise ValueError(
+                    f"{os.path.basename(p)} has a different montage "
+                    f"({names}) than {ch_names}. Refusing to guess a mapping."
+                )
+            X = np.asarray(z["X"], dtype=np.float64)
+            if X.shape[2] != int(round(action_s * sfreq)):
+                log.warning("%s window is %d samples, expected %d.",
+                            os.path.basename(p), X.shape[2],
+                            int(round(action_s * sfreq)))
+            Xs.append(X)
+            y_go.append(np.asarray(z["y_go"], int))
+            y_word.append(np.asarray(z["y_word"], int))
+            subs.append(np.full(len(X), int(z["subject"])))
+
+    X = np.concatenate(Xs)
+    y_go = np.concatenate(y_go)
+    y_word = np.concatenate(y_word)
+    subjects = np.concatenate(subs)
+
+    # Train at the board's native rate: the recordings define the rate, so the
+    # online path can run with --no-resample and match exactly.
+    if abs(cfg.sfreq - sfreq) > 1e-6:
+        log.info("Adopting calibration sampling rate %.0f Hz (was %.0f).", sfreq, cfg.sfreq)
+        cfg.sfreq = sfreq
+
+    X = _preprocess_array(X, sfreq, cfg)
+    log.info("Calibration: %d recording(s), %d subject(s), %d trials, %d ch @ %.0f Hz.",
+             len(paths), len(np.unique(subjects)), len(X), X.shape[1], sfreq)
+
+    if cfg.task == "word":
+        keep = y_word >= 0
+        if not keep.any():
+            raise ValueError(
+                "No attempt trials with word labels in the calibration data; "
+                "the word task needs them."
+            )
+        return Epochs(
+            X=X[keep], y=y_word[keep], subjects=subjects[keep], sfreq=sfreq,
+            ch_names=ch_names, label_names=CLASS_NAMES,
+        )
+
+    rest = y_go == 0
+    log.info("GO task from same-session calibration: %d attempt vs %d rest trials.",
+             int((~rest).sum()), int(rest.sum()))
+    return _finalize_task(
+        X[~rest], np.zeros((~rest).sum(), int), subjects[~rest], None, cfg, sfreq,
+        ch_names, rest_X=X[rest], rest_subjects=subjects[rest],
+    )
+
+
 def load_dataset(cfg: Config) -> Epochs:
     """Load real recorded EEG. There is no surrogate/synthetic fallback.
 
@@ -596,13 +682,21 @@ def load_dataset(cfg: Config) -> Epochs:
     generated data.
     """
     cfg.validate()
+    if cfg.calibration_glob:
+        ep = load_calibration(cfg)
+        log.info(ep.summary())
+        return ep
     if not cfg.data_root:
         raise ValueError(
-            "No dataset given. This pipeline only runs on real recorded EEG.\n"
-            "Pass --data /path/to/ds003626 (Nieto 'Thinking out loud').\n"
-            "To fetch it:\n"
+            "No data given. This pipeline only runs on real recorded EEG.\n"
+            "Either pass your own same-session recordings (preferred for the GO "
+            "task, which is confounded on ds003626):\n"
+            "    python calibrate.py --port <serial> --subject 1 --channel-names ...\n"
+            "    python run.py --calibration 'calib/*.npz' --task go\n"
+            "or the public dataset:\n"
             "    pip install openneuro-py\n"
-            "    openneuro-py download --dataset ds003626 --target-dir ds003626"
+            "    openneuro-py download --dataset ds003626 --target-dir ds003626\n"
+            "    python run.py --data ./ds003626 --task word"
         )
     if not os.path.isdir(cfg.data_root):
         raise FileNotFoundError(

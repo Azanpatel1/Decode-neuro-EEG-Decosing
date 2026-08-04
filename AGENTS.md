@@ -67,13 +67,15 @@ eeg_tvns_pipeline/
 ├── README.md             human-facing usage guide
 ├── requirements.txt      core deps (brainflow/openneuro-py optional, commented)
 ├── run.py                CLI: load → evaluate → fit → save model → latency + plots
+├── calibrate.py          thin root entry point for the calibration recorder
 ├── acquisition.py        thin root entry point for the live loop
 ├── dashboard.py          thin root entry point for the live browser dashboard
 └── eeg_tvns/
     ├── __init__.py       public API + version
     ├── config.py         Config dataclass — the single source of run settings
     ├── preprocessing.py  SHARED band-pass/notch/resample (train + live use this)
-    ├── data_loader.py    ds003626 loader + montage select (real data only)
+    ├── data_loader.py    ds003626 + calibration loaders, montage select (real only)
+    ├── calibrate.py      same-session cued attempt/rest recorder (GO training)
     ├── pipeline.py       Covariances → RiemannianAlignment → TangentSpace → clf
     ├── evaluate.py       leakage-free LOSO + within-subject + permutation chance
     ├── realtime.py       RealTimeDecoder (GO gate + online recentering) + latency
@@ -171,11 +173,15 @@ openneuro-py download --dataset ds003626 --target-dir ds003626
 ```
 
 ```bash
-# 1. Train the GO decoder (this is what gates tVNS)
+# 1. GO decoder. Prefer your own same-session recording -- the ds003626 GO task is
+#    block-confounded (see T2b) and must not gate stimulation.
+python calibrate.py --port /dev/cu.usbserial-XXXX --subject 1 --channel-names "F7,F8,..."
+python run.py --calibration 'calib/*.npz' --task go
+#    -> writes outputs/model_go.joblib, metrics_go.json, and plots
+#    ds003626 variant, offline research only:
 python run.py --data ./ds003626 --task go --condition overt_scaffold
-#    -> writes outputs/model_go.joblib, metrics.json, confusion_matrix.png, latency_hist.png
 
-# 2. 4-class word decoder (display/tracking only)
+# 2. 4-class word decoder (display/tracking only; measured AT CHANCE on real data)
 python run.py --data ./ds003626 --task word --condition inner
 
 # 3. Ablation: alignment matters (cross-subject score should drop with --no-align)
@@ -191,10 +197,22 @@ python dashboard.py --port /dev/cu.usbserial-XXXX --model outputs/model_go.jobli
 #    -> open http://127.0.0.1:8765
 ```
 
-**Expected sanity signals:** permutation `observed` sits well above `null_mean`
-with a low `p_value` (report nothing without this comparison); online latency is
-single-digit milliseconds, far under the 300 ms budget; on the live loop, `p_go`
-tracks actual speech attempts and tVNS fires with the refractory respected.
+**Expected sanity signals:** online latency is single-digit milliseconds, far under
+the 300 ms budget; on the live loop, `p_go` tracks actual speech attempts and tVNS
+fires with the refractory respected. Permutation `observed` should sit above
+`null_mean` with a low `p_value` — but treat that as necessary, not sufficient: it
+only shows *some* learnable structure exists, and on the ds003626 GO task that
+structure is which recording block a window came from (p=0.005 while decoding
+block identity). Always pair it with a control that shares the confound.
+
+**Measured baselines on real data (leakage-free LOSO, 10 subjects, 16 ch)** — do
+not "improve" these by loosening the evaluation:
+
+| Problem | LOSO bacc | Chance | Note |
+|---|---|---|---|
+| Word, 4-class inner | 0.266 | 0.250 | at chance, p=0.50 |
+| GO, baseline-block rest | 0.920 | 0.500 | confounded; block identity |
+| GO, same-block rest (0.5 s control) | 0.540 | 0.500 | the honest estimate |
 
 **Verifying without data or hardware** — you can still check that the code
 imports, the CLIs parse, and the guardrails hold. These must all fail loudly
@@ -230,16 +248,21 @@ The old low-power surrogate is gone and must not come back (Invariant F). Still
 worth verifying against real data: confirm the printed attempt/rest counts are
 balanced and that GO LOSO beats its permutation baseline.
 
-**T2b — Record same-session calibration data for a deployable GO gate.**
-The ds003626 GO problem is confounded: its only rest is a separate baseline block,
-and at a matched 0.5 s window baseline-block rest scores 0.80 LOSO balanced
-accuracy while same-block rest (pre-cue interval of the same trials) scores 0.54.
-The high GO numbers therefore reflect block identity, not speech attempt, and a
-model trained that way must not gate stimulation. What's needed: a calibration
-recording on the target hardware that interleaves cued attempt and cued rest
-within one session, so both classes share block, impedance and arousal context.
-*Accept when:* `--task go` can be built from a same-session calibration recording,
-and its LOSO/within-session score is reported next to the same-block control above.
+**T2b — PARTLY DONE. Same-session calibration for a deployable GO gate.**
+Built: `eeg_tvns/calibrate.py` + `calibrate.py` record cued overt attempt vs rest
+randomly interleaved in one recording (runs capped at 3 so drift cannot align with
+class), stored raw at board rate; `data_loader.load_calibration` + `run.py
+--calibration` train on it at the board's native rate. **Still open:** nobody has
+recorded real calibration data yet, so the GO decoder remains unvalidated. Until
+that exists, `outputs/model_go.joblib` is a ds003626 baseline-block model and must
+not gate stimulation. *Accept when:* a real recording exists, its GO score is
+reported next to the 0.54 same-block control, and it beats that control.
+
+Background — why this task exists: ds003626's only rest is a separate baseline
+block. At a matched 0.5 s window, holding the action epochs fixed and changing
+only the rest source, baseline-block rest scores 0.798 LOSO balanced accuracy
+while same-block rest (pre-cue interval of the same trials) scores 0.540. The high
+GO numbers reflect block identity, not speech attempt.
 
 **T3 — Add stimulation control arms.**
 Add `paired` (current behavior), `unpaired/delayed`, and `sham` modes to
