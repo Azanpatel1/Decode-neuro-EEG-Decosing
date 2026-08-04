@@ -37,6 +37,7 @@ from .acquisition import (
 )
 from .config import CLASS_NAMES, Config
 from .realtime import Decision, RealTimeDecoder
+from .signal_quality import live_quality, scalp_positions
 
 log = logging.getLogger("eeg_tvns.dashboard")
 
@@ -91,6 +92,16 @@ class FrameHub:
         self._word: dict = {"label": None, "name": None, "probs": {}, "latency_ms": 0.0}
         self._trigger: Optional[dict] = None
         self._status: dict = {"state": "starting", "detail": ""}
+        self._quality: List[dict] = []
+        self._impedance: dict = {}
+        # Top-down scalp coordinates for the trained montage, so the head map can
+        # draw each electrode where it actually sits. Sites we cannot place are
+        # reported rather than drawn somewhere invented.
+        self.scalp = scalp_positions(self.ch_names)
+        self.unplaced = [c for c in self.ch_names if c not in self.scalp]
+        if self.unplaced:
+            log.warning("No 10-20 position for %s; omitted from the head map.",
+                        ", ".join(self.unplaced))
 
         self._latest: dict = {
             "t": 0.0,
@@ -103,6 +114,19 @@ class FrameHub:
             "n_fires": 0,
         }
         self._frame_id = 0
+
+    def set_quality(self, qualities: List[dict]) -> None:
+        with self._lock:
+            self._quality = qualities
+
+    def set_impedance(self, data: dict) -> None:
+        """Attach impedance results from a prior `calibrate.py --check-signal` run.
+
+        Impedance needs injected current, so it cannot be measured while decoding;
+        the UI shows these with their age to make clear they are not live.
+        """
+        with self._lock:
+            self._impedance = data or {}
 
     def set_status(self, state: str, detail: str = "") -> None:
         """Report acquisition health so the UI can distinguish 'no signal' from
@@ -188,6 +212,10 @@ class FrameHub:
                 "word": dict(self._word),
                 "trigger": dict(self._trigger) if self._trigger else None,
                 "status": dict(self._status),
+                "quality": list(self._quality),
+                "impedance": dict(self._impedance),
+                "scalp": self.scalp,
+                "unplaced": list(self.unplaced),
                 "latency_stats": {
                     "median_ms": float(np.median(lat_arr)),
                     "p95_ms": float(np.percentile(lat_arr, 95)),
@@ -245,7 +273,8 @@ class WordReadout:
 class AcquisitionThread(threading.Thread):
     def __init__(self, streamer, decoder: RealTimeDecoder, hub: FrameHub,
                  hop_s: float, refractory_s: float,
-                 word_readout: Optional[WordReadout] = None):
+                 word_readout: Optional[WordReadout] = None,
+                 line_freq: float = 60.0, quality_period_s: float = 0.5):
         super().__init__(daemon=True, name="eeg-tvns-acq")
         self.streamer = streamer
         self.decoder = decoder
@@ -253,17 +282,47 @@ class AcquisitionThread(threading.Thread):
         self.hop_s = hop_s
         self.refractory_s = refractory_s
         self.word_readout = word_readout
+        self.line_freq = line_freq
+        self.quality_period_s = quality_period_s
+        self._last_quality_t = 0.0
         self._stop = threading.Event()
         self.error: Optional[BaseException] = None
 
     def stop(self) -> None:
         self._stop.set()
 
+    def _update_quality(self) -> None:
+        """Contact metrics from the raw board window, throttled.
+
+        Runs in the observer (after the GO decision has been made and acted on) and
+        only a couple of times a second, so the FFTs never sit on the decision path.
+        Uses the *raw* window: the processed one has mains notched out and DC
+        removed, which is exactly what these metrics look for.
+        """
+        now = time.perf_counter()
+        if now - self._last_quality_t < self.quality_period_s:
+            return
+        raw = getattr(self.streamer, "last_raw", None)
+        if raw is None:
+            return
+        self._last_quality_t = now
+        order = getattr(self.streamer, "channel_order", None)
+        eeg = raw[order, :] if order is not None else raw
+        names = self.hub.ch_names
+        if eeg.shape[0] != len(names):
+            return
+        qs = live_quality(eeg, self.streamer.board_fs, names, line_freq=self.line_freq)
+        self.hub.set_quality([q.to_dict() for q in qs])
+
     def _on_frame(self, window: np.ndarray, decision: Decision, fired: bool) -> None:
         word = None
         if self.word_readout is not None and decision.go:
             word = self.word_readout.decode(window)
         self.hub.publish(window, decision, fired, word=word)
+        try:
+            self._update_quality()
+        except Exception:
+            log.exception("quality update failed; continuing")
 
     def run(self) -> None:
         try:
@@ -377,6 +436,17 @@ INDEX_HTML = r"""<!doctype html>
     border-bottom: 1px solid rgba(255, 90, 90, 0.35); }
   #banner.show { display: block; }
   #banner b { color: #fff; }
+  /* Tall enough that the head circle is limited by the column width, not by
+     height -- at 208px the markers for close pairs (FT7/FC5) collided. */
+  #head { width: 100%; height: 296px; display: block; }
+  .legend { display: flex; gap: 12px; font-size: 10px; color: var(--muted);
+    margin-top: 4px; justify-content: center; }
+  .legend i.sw { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    margin-right: 4px; vertical-align: middle; }
+  .sw.good { background: #35d07f; } .sw.ok { background: #e8c34a; }
+  .sw.bad { background: #ff5a5a; } .sw.unknown { background: #3a4452; }
+  #headTip { min-height: 28px; }
+  #headTip b { color: var(--text); }
 </style>
 </head>
 <body>
@@ -426,6 +496,20 @@ INDEX_HTML = r"""<!doctype html>
         Never gates stimulation.
       </div>
     </section>
+    <section id="headPanel" class="panel">
+      <h2>Electrode contact <span class="note" id="headMeta">live</span></h2>
+      <canvas id="head"></canvas>
+      <div class="legend">
+        <span><i class="sw good"></i>good</span>
+        <span><i class="sw ok"></i>marginal</span>
+        <span><i class="sw bad"></i>bad</span>
+        <span><i class="sw unknown"></i>no data</span>
+      </div>
+      <div id="headTip" class="disclaimer">
+        Hover an electrode for its measured values.
+      </div>
+      <div id="impNote" class="disclaimer"></div>
+    </section>
     <section id="pgoPanel" class="panel">
       <h2>p(go) history</h2>
       <canvas id="pgo_chart"></canvas>
@@ -442,7 +526,7 @@ INDEX_HTML = r"""<!doctype html>
 </footer>
 <script>
 const $ = (id) => document.getElementById(id);
-const state = { data: null, ws: null, lastFireT: -1 };
+const state = { data: null, ws: null, lastFireT: -1, headHits: [] };
 
 function fitCanvas(c) {
   const r = c.getBoundingClientRect();
@@ -602,6 +686,120 @@ function drawSeries(canvasId, values, opts) {
   ctx.stroke();
 }
 
+const STATUS_FILL = { good: '#35d07f', ok: '#e8c34a', bad: '#ff5a5a', unknown: '#3a4452' };
+
+// Top-down scalp map. Positions come from the server (standard_1020, azimuthal
+// projection) and colours from measured values -- nothing here is decorative.
+function drawHead() {
+  const d = state.data, c = $('head');
+  if (!c) return;
+  const dpr = fitCanvas(c), ctx = c.getContext('2d');
+  const W = c.width, H = c.height;
+  ctx.clearRect(0, 0, W, H);
+  const scalp = d.scalp || {}, names = Object.keys(scalp);
+  const cx = W / 2, cy = H / 2, R = Math.min(W, H) / 2 - 16 * dpr;
+
+  ctx.strokeStyle = '#2a3340';
+  ctx.lineWidth = 1.5 * dpr;
+  ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2); ctx.stroke();
+  // nose (up) and ears, so left/right is unambiguous
+  ctx.beginPath();
+  ctx.moveTo(cx - 7 * dpr, cy - R); ctx.lineTo(cx, cy - R - 10 * dpr);
+  ctx.lineTo(cx + 7 * dpr, cy - R); ctx.stroke();
+  [-1, 1].forEach(s => {
+    ctx.beginPath();
+    ctx.ellipse(cx + s * R, cy, 4 * dpr, 11 * dpr, 0, 0, Math.PI * 2);
+    ctx.stroke();
+  });
+
+  // The closest 10-20 pair on this layout (FT8/FC6) sits 0.192 head-radii apart,
+  // so cap the marker at half that to guarantee they never overlap at any size.
+  const r = Math.max(4 * dpr, Math.min(12.5 * dpr, R * 0.192 * 0.5));
+
+  const byName = {};
+  (d.quality || []).forEach(q => { byName[q.name] = q; });
+  const imp = (d.impedance && d.impedance.channels) || {};
+  state.headHits = [];
+
+  names.forEach(n => {
+    const p = scalp[n];
+    // Projection is nose-up (+y); canvas y grows downward, so flip it.
+    const x = cx + p[0] * R, y = cy - p[1] * R;
+    const q = byName[n];
+    const zk = imp[n];
+    let status = q ? q.status : 'unknown';
+    if (!q && zk != null) {
+      status = zk <= 5 ? 'good' : (zk <= 20 ? 'ok' : 'bad');
+    }
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = STATUS_FILL[status] || STATUS_FILL.unknown;
+    ctx.globalAlpha = status === 'unknown' ? 0.5 : 0.85;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = 'rgba(0,0,0,0.45)'; ctx.lineWidth = 1 * dpr; ctx.stroke();
+    ctx.fillStyle = status === 'unknown' ? '#8b97a8' : '#0b0e13';
+    ctx.font = `600 ${Math.max(7 * dpr, r * 0.8)}px ui-monospace, monospace`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(n, x, y);
+    state.headHits.push({ name: n, x: x / dpr, y: y / dpr, r: r / dpr });
+  });
+
+  const qs = d.quality || [];
+  const nBad = qs.filter(q => q.status === 'bad').length;
+  const nOk = qs.filter(q => q.status === 'ok').length;
+  $('headMeta').innerHTML = !qs.length ? 'awaiting data'
+    : nBad ? `<b>${nBad}</b> bad` + (nOk ? `, ${nOk} marginal` : '')
+    : nOk ? `<b>${nOk}</b> marginal, rest good`
+    : 'all channels good';
+
+  const note = $('impNote');
+  if (d.impedance && d.impedance.timestamp) {
+    const age = (Date.now() / 1000 - d.impedance.timestamp) / 60;
+    note.innerHTML = `Impedance from a check <b>${age.toFixed(0)} min</b> ago `
+      + `(not live \u2014 measuring it injects current and suspends EEG).`;
+  } else {
+    note.textContent = 'Colour is from live amplitude and mains noise. For true '
+      + 'impedance in k\u03A9, run: calibrate.py --check-signal';
+  }
+  if ((d.unplaced || []).length) {
+    note.innerHTML += `<br>No 10-20 position for: ${d.unplaced.join(', ')} `
+      + `\u2014 not shown on the map.`;
+  }
+}
+
+function headTipFor(name) {
+  const d = state.data;
+  const q = (d.quality || []).find(x => x.name === name);
+  const zk = ((d.impedance && d.impedance.channels) || {})[name];
+  if (!q && zk == null) return `<b>${name}</b>: no measurement yet.`;
+  const bits = [];
+  if (zk != null) bits.push(`impedance <b>${zk.toFixed(1)} k\u03A9</b>`);
+  if (q) {
+    bits.push(`RMS <b>${q.rms_uv.toFixed(1)} \u00B5V</b>`);
+    bits.push(`mains <b>${(q.line_ratio * 100).toFixed(0)}%</b> of power`);
+  }
+  let s = `<b>${name}</b> \u2014 ` + bits.join(' \u00B7 ');
+  if (q && q.reason) s += `<br>${q.reason}`;
+  return s;
+}
+
+(function bindHeadHover() {
+  const c = $('head');
+  if (!c) return;
+  c.addEventListener('mousemove', (e) => {
+    const rect = c.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    const hit = (state.headHits || []).find(
+      h => (mx - h.x) ** 2 + (my - h.y) ** 2 <= (h.r + 3) ** 2);
+    $('headTip').innerHTML = hit
+      ? headTipFor(hit.name)
+      : 'Hover an electrode for its measured values.';
+  });
+  c.addEventListener('mouseleave', () => {
+    $('headTip').innerHTML = 'Hover an electrode for its measured values.';
+  });
+})();
+
 function render() {
   const d = state.data;
   if (!d) return;
@@ -646,6 +844,7 @@ function render() {
   drawEEG();
   drawTrigger();
   renderWord();
+  drawHead();
   drawSeries('pgo_chart', d.p_history || [], {
     yMin: 0, yMax: 1, threshold: d.go_threshold ?? 0.5, color: 'rgba(89,209,160,0.95)' });
 }
@@ -800,6 +999,11 @@ def main(argv=None) -> None:
     ap.add_argument("--web-port", type=int, default=8765)
     ap.add_argument("--publish-hz", type=float, default=10.0,
                     help="UI refresh rate (decode loop rate is unchanged)")
+    ap.add_argument("--line-freq", type=float, default=60.0,
+                    help="mains frequency for the contact-quality metric (60 US, 50 EU)")
+    ap.add_argument("--impedance-json", default="outputs/impedance.json",
+                    help="impedances from 'calibrate.py --check-signal', shown on the "
+                         "head map with their age. Impedance cannot be measured live.")
     args = ap.parse_args(argv)
 
     bundle, cfg, decoder, model_sfreq, n_model_ch = load_decoder(args.model)
@@ -830,8 +1034,18 @@ def main(argv=None) -> None:
         go_threshold=cfg.go_threshold,
     )
 
+    if args.impedance_json and os.path.exists(args.impedance_json):
+        try:
+            with open(args.impedance_json) as fh:
+                hub.set_impedance(json.load(fh))
+            log.info("Loaded impedance check from %s", args.impedance_json)
+        except Exception:
+            log.warning("Could not read %s; head map will show live metrics only.",
+                        args.impedance_json, exc_info=True)
+
     acq = AcquisitionThread(streamer, decoder, hub, hop_s=hop,
-                            refractory_s=args.refractory, word_readout=word_readout)
+                            refractory_s=args.refractory, word_readout=word_readout,
+                            line_freq=args.line_freq)
     acq.start()
 
     try:

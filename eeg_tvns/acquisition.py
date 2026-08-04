@@ -68,6 +68,12 @@ class BaseStreamer:
         self.board_fs: float = model_sfreq          # subclasses override
         self.n_source_channels: int = 0             # subclasses override
         self._bp = self._notch = None
+        # Most recent *unprocessed* board window, kept for contact-quality
+        # readouts. Filtering removes exactly what those metrics need (the notch
+        # kills the mains estimate, the band-pass hides DC railing), so observers
+        # get the raw signal. This is a reference assignment, not a copy, so it
+        # costs nothing on the decision path.
+        self.last_raw: Optional[np.ndarray] = None
 
     def _init_filters(self) -> None:
         self._bp, self._notch = design_filters(
@@ -97,6 +103,7 @@ class BaseStreamer:
     # -- shared window preparation -----------------------------------------
     def process_window(self, raw: np.ndarray) -> np.ndarray:
         """raw: (n_source_channels, win_samples) -> (n_model_channels, n_samp)."""
+        self.last_raw = raw
         eeg = raw
         if self.channel_order is not None:
             eeg = eeg[self.channel_order, :]

@@ -281,6 +281,50 @@ def save_calibration(
              X.shape[1], sfreq)
 
 
+def check_signal(
+    serial_port: str,
+    ch_names: List[str],
+    seconds: float = 4.0,
+    line_freq: Optional[float] = 60.0,
+    impedance: bool = True,
+    impedance_input: str = "n",
+) -> List:
+    """Report contact quality per electrode before a session.
+
+    Collects a plain EEG window for the continuous metrics (amplitude, mains
+    noise, railing), then optionally runs the ADS1299 lead-off impedance check.
+    Impedance injects current and so cannot run at the same time as the EEG
+    measurement -- hence the two phases.
+    """
+    from .signal_quality import live_quality, measure_impedance, merge_quality
+
+    with BoardRecorder(serial_port) as rec:
+        n_board_ch = len(rec.eeg_rows)
+        if n_board_ch != len(ch_names):
+            raise ValueError(
+                f"Board exposes {n_board_ch} EEG channels but {len(ch_names)} "
+                "names were given. Pass one label per board channel, in board order."
+            )
+        log.info("Collecting %.1f s of EEG for signal metrics…", seconds)
+        time.sleep(seconds)
+        data = rec.collected()
+        if data.size == 0:
+            raise RuntimeError(
+                "No data arrived from the board. Check the dongle, the Cyton's "
+                "power switch, and that the OpenBCI GUI is closed."
+            )
+        window = data[rec.eeg_rows, :]
+        live = live_quality(window, rec.sfreq, ch_names, line_freq=line_freq)
+
+        if impedance:
+            log.info("Measuring impedance (injects 6 nA @ 31.2 Hz, one channel at "
+                     "a time; not EEG during this phase)…")
+            imp = measure_impedance(rec.board, rec.eeg_rows, rec.sfreq, ch_names,
+                                    input_side=impedance_input)
+            live = merge_quality(live, imp)
+    return live
+
+
 def run_calibration(
     serial_port: str,
     schedule: CueSchedule,

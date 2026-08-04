@@ -18,6 +18,7 @@ Requires real hardware (pip install brainflow). Nothing here simulates a board.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -27,12 +28,36 @@ from eeg_tvns.calibrate import (
     ATTEMPT,
     REST,
     build_schedule,
+    check_signal,
     run_calibration,
     save_calibration,
 )
 
 BOLD, DIM, RESET = "\033[1m", "\033[2m", "\033[0m"
-GREEN, YELLOW, CYAN = "\033[32m", "\033[33m", "\033[36m"
+GREEN, YELLOW, CYAN, RED = "\033[32m", "\033[33m", "\033[36m", "\033[31m"
+STATUS_COLOUR = {"good": GREEN, "ok": YELLOW, "bad": RED, "unknown": DIM}
+STATUS_MARK = {"good": "GOOD", "ok": "OK", "bad": "BAD", "unknown": "?"}
+
+
+def print_quality(qualities) -> int:
+    """Print the per-electrode quality table. Returns the count of bad channels."""
+    print(f"\n{BOLD}Electrode contact quality{RESET}")
+    print(f"  {DIM}impedance: <5 kOhm good, 5-20 ok, >20 bad · "
+          f"amplitude and mains noise measured from live EEG{RESET}")
+    print(f"\n  {'Ch':>2}  {'Site':<5} {'Impedance':>10}  {'RMS':>9}  "
+          f"{'Mains':>6}  Status")
+    print("  " + "-" * 66)
+    n_bad = 0
+    for q in qualities:
+        col = STATUS_COLOUR[q.status]
+        z = "—" if q.impedance_kohm is None else f"{q.impedance_kohm:.1f} kΩ"
+        print(f"  {q.index + 1:>2}  {q.name:<5} {z:>10}  {q.rms_uv:>7.1f} µV  "
+              f"{q.line_ratio * 100:>5.0f}%  {col}{STATUS_MARK[q.status]}{RESET}")
+        if q.status == "bad":
+            n_bad += 1
+        if q.reason():
+            print(f"      {DIM}{q.reason()}{RESET}")
+    return n_bad
 
 
 def present(kind: str, text: str, seconds: float) -> None:
@@ -65,9 +90,47 @@ def main(argv=None) -> int:
                     help="length of the analysed window per trial")
     ap.add_argument("--out-dir", default="calib")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--check-signal", action="store_true",
+                    help="report per-electrode contact quality and exit (no recording)")
+    ap.add_argument("--no-impedance", action="store_true",
+                    help="with --check-signal, skip the current-injection impedance "
+                         "phase and report live metrics only")
+    ap.add_argument("--impedance-input", choices=["n", "p"], default="n",
+                    help="which ADS input the test current drives; depends on how the "
+                         "reference is wired. If every channel reports no test "
+                         "signal, try the other one (default: n)")
+    ap.add_argument("--line-freq", type=float, default=60.0,
+                    help="mains frequency for the noise metric (60 US, 50 EU)")
+    ap.add_argument("--impedance-out", default="outputs/impedance.json",
+                    help="where --check-signal writes measured impedances for the "
+                         "dashboard head map")
     args = ap.parse_args(argv)
 
     ch_names = [c.strip() for c in args.channel_names.split(",") if c.strip()]
+
+    if args.check_signal:
+        try:
+            q = check_signal(args.port, ch_names, line_freq=args.line_freq,
+                             impedance=not args.no_impedance,
+                             impedance_input=args.impedance_input)
+        except Exception as exc:
+            print(f"{YELLOW}Signal check failed:{RESET} {exc}")
+            return 1
+        n_bad = print_quality(q)
+        measured = {c.name: c.impedance_kohm for c in q if c.impedance_kohm is not None}
+        if measured:
+            os.makedirs(os.path.dirname(args.impedance_out) or ".", exist_ok=True)
+            with open(args.impedance_out, "w") as fh:
+                json.dump({"timestamp": time.time(), "channels": measured,
+                           "input_side": args.impedance_input}, fh, indent=2)
+            print(f"\n{DIM}Impedance written to {args.impedance_out}; the dashboard "
+                  f"displays it with its age.{RESET}")
+        if n_bad:
+            print(f"\n{YELLOW}{n_bad} channel(s) need attention{RESET} — reseat or "
+                  f"re-gel those electrodes, then re-run this check.")
+        else:
+            print(f"\n{GREEN}All channels look usable.{RESET} Ready to record.")
+        return 1 if n_bad else 0
     sched = build_schedule(n_per_class=args.trials_per_class, action_s=args.action_s,
                            seed=args.seed)
 

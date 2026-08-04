@@ -28,6 +28,13 @@ from .acquisition import (
     run_loop,
     load_decoder,
 )
+from .signal_quality import (
+    ChannelQuality,
+    impedance_from_std_uv,
+    live_quality,
+    measure_impedance,
+    scalp_positions,
+)
 
 __version__ = "1.1.0"
 
@@ -52,4 +59,9 @@ __all__ = [
     "OpenBCIStreamer",
     "run_loop",
     "load_decoder",
+    "ChannelQuality",
+    "live_quality",
+    "measure_impedance",
+    "impedance_from_std_uv",
+    "scalp_positions",
 ]
