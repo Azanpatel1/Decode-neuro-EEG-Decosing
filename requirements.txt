@@ -1,0 +1,15 @@
+numpy>=1.24
+scipy>=1.10
+scikit-learn>=1.3
+pyriemann>=0.5
+mne>=1.5
+joblib>=1.3
+matplotlib>=3.7
+# optional, only for downloading the real dataset:
+# openneuro-py>=2024.1
+# optional, only for LIVE OpenBCI hardware acquisition (acquisition.py):
+# brainflow>=5.10
+# optional, only for the live browser dashboard (dashboard.py):
+# fastapi>=0.110,<0.120
+# uvicorn>=0.27,<0.35
+# websockets>=12
