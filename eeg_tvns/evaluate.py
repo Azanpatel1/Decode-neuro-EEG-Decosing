@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 from sklearn.base import clone
@@ -38,6 +38,25 @@ from .pipeline import (
 )
 
 log = logging.getLogger("eeg_tvns.eval")
+
+# (done, total, label) -> None. Optional throughout, so the CLI path is unchanged
+# and the dashboard can show progress on the slow loops without either knowing
+# about the other.
+Progress = Callable[[int, int, str], None]
+ShouldStop = Callable[[], bool]
+
+
+def _tick(progress: Optional[Progress], done: int, total: int, label: str) -> None:
+    if progress is None:
+        return
+    try:
+        progress(done, total, label)
+    except Exception:
+        log.exception("progress callback failed; continuing")
+
+
+class Cancelled(RuntimeError):
+    """Raised when a caller's should_stop() asks a long evaluation to give up."""
 
 
 @dataclass
@@ -124,7 +143,8 @@ def _cov_classifier(cfg: Config):
 # ---------------------------------------------------------------------------
 # Cross-subject (leave-one-subject-out) -- the headline generalisation number
 # ---------------------------------------------------------------------------
-def evaluate_cross_subject(ep: Epochs, cfg: Config) -> EvalResult:
+def evaluate_cross_subject(ep: Epochs, cfg: Config,
+                           progress: Optional[Progress] = None) -> EvalResult:
     covs = _covariances(ep.X, cfg)
     subjects, y = ep.subjects, ep.y
     uniq = np.unique(subjects)
@@ -133,7 +153,8 @@ def evaluate_cross_subject(ep: Epochs, cfg: Config) -> EvalResult:
 
     res = EvalResult(kind="cross-subject LOSO", labels=ep.label_names)
     yt, yp, ys = [], [], []
-    for test_s in uniq:
+    for done, test_s in enumerate(uniq):
+        _tick(progress, done, len(uniq), f"LOSO fold {done + 1}/{len(uniq)}")
         tr = subjects != test_s
         te = ~tr
         if te.sum() == 0 or tr.sum() == 0:
@@ -169,9 +190,12 @@ def _positive_scores(model, Xte) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Within-subject (per-patient calibration ceiling)
 # ---------------------------------------------------------------------------
-def evaluate_within_subject(ep: Epochs, cfg: Config) -> EvalResult:
+def evaluate_within_subject(ep: Epochs, cfg: Config,
+                            progress: Optional[Progress] = None) -> EvalResult:
     res = EvalResult(kind="within-subject CV", labels=ep.label_names)
-    for s in np.unique(ep.subjects):
+    uniq = np.unique(ep.subjects)
+    for done, s in enumerate(uniq):
+        _tick(progress, done, len(uniq), f"within-subject {done + 1}/{len(uniq)}")
         m = ep.subjects == s
         Xs, ys_ = ep.X[m], ep.y[m]
         if len(np.unique(ys_)) < 2 or np.min(np.bincount(ys_)) < cfg.inner_cv_folds:
@@ -190,9 +214,15 @@ def evaluate_within_subject(ep: Epochs, cfg: Config) -> EvalResult:
 # ---------------------------------------------------------------------------
 # Empirical chance via label permutation
 # ---------------------------------------------------------------------------
-def permutation_chance(ep: Epochs, cfg: Config, n_perm: Optional[int] = None) -> Dict:
+def permutation_chance(ep: Epochs, cfg: Config, n_perm: Optional[int] = None,
+                       progress: Optional[Progress] = None,
+                       should_stop: Optional[ShouldStop] = None) -> Dict:
     """Pooled k-fold score with true labels vs. a null distribution built by
-    shuffling labels. Returns observed score, null mean, and a p-value."""
+    shuffling labels. Returns observed score, null mean, and a p-value.
+
+    This is the dominant cost of a training run (`n_perm` full refits), so it is
+    the one loop that reports progress and honours cancellation.
+    """
     n_perm = n_perm if n_perm is not None else cfg.n_permutations
     covs = _covariances(ep.X, cfg)
     y = ep.y
@@ -208,8 +238,22 @@ def permutation_chance(ep: Epochs, cfg: Config, n_perm: Optional[int] = None) ->
             scores.append(balanced_accuracy_score(labels[te], model.predict(covs[te])))
         return float(np.mean(scores))
 
+    _tick(progress, 0, n_perm + 1, "permutation: observed score")
     observed = pooled_score(y)
-    null = np.array([pooled_score(rng.permutation(y)) for _ in range(n_perm)])
+    if n_perm <= 0:
+        # No null distribution means no empirical chance level, so say so rather
+        # than emitting a p-value computed from nothing.
+        log.warning("Permutation test skipped (n_permutations=0): the observed "
+                    "%.3f has no chance baseline to be compared against.", observed)
+        return {"observed": observed, "null_mean": None, "null_std": None,
+                "p_value": None, "n_permutations": 0}
+    null_list = []
+    for i in range(n_perm):
+        if should_stop is not None and should_stop():
+            raise Cancelled(f"cancelled after {i} of {n_perm} permutations")
+        null_list.append(pooled_score(rng.permutation(y)))
+        _tick(progress, i + 1, n_perm + 1, f"permutation {i + 1}/{n_perm}")
+    null = np.array(null_list)
     p = (np.sum(null >= observed) + 1) / (n_perm + 1)
     log.info(
         "Permutation: observed=%.3f  null=%.3f+/-%.3f  p=%.4f (n=%d)",

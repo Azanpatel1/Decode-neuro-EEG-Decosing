@@ -26,25 +26,17 @@ Two sources:
 
 Outputs (in ./outputs), suffixed per task: model_<task>.joblib,
 metrics_<task>.json, and plots.
+
+The training itself lives in eeg_tvns/training.py, which the dashboard's Train tab
+also calls -- so a model trained here and one trained there are identical.
 """
 from __future__ import annotations
 
 import argparse
-import json
 import logging
-import os
-
-import numpy as np
 
 from eeg_tvns.config import Config
-from eeg_tvns.data_loader import load_dataset
-from eeg_tvns.pipeline import build_pipeline
-from eeg_tvns.evaluate import (
-    evaluate_cross_subject,
-    evaluate_within_subject,
-    permutation_chance,
-)
-from eeg_tvns.realtime import benchmark_latency
+from eeg_tvns.training import train
 
 
 def parse_args() -> Config:
@@ -92,127 +84,32 @@ def parse_args() -> Config:
     return cfg
 
 
-def maybe_plots(cfg: Config, xsub, latency) -> list:
-    if not cfg.make_plots:
-        return []
-    paths = []
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from sklearn.metrics import confusion_matrix
-
-        if xsub.y_true is not None:
-            labels = sorted(xsub.labels)
-            cm = confusion_matrix(xsub.y_true, xsub.y_pred, labels=labels, normalize="true")
-            fig, ax = plt.subplots(figsize=(4.2, 3.6))
-            im = ax.imshow(cm, cmap="Blues", vmin=0, vmax=1)
-            ax.set_xticks(range(len(labels))); ax.set_yticks(range(len(labels)))
-            names = [xsub.labels[l] for l in labels]
-            ax.set_xticklabels(names, rotation=45, ha="right"); ax.set_yticklabels(names)
-            ax.set_xlabel("predicted"); ax.set_ylabel("true")
-            ax.set_title("Cross-subject confusion (normalised)")
-            for i in range(len(labels)):
-                for j in range(len(labels)):
-                    ax.text(j, i, f"{cm[i,j]:.2f}", ha="center", va="center",
-                            color="white" if cm[i, j] > 0.5 else "black", fontsize=8)
-            fig.colorbar(im, fraction=0.046)
-            fig.tight_layout()
-            cpath = os.path.join(cfg.out_dir, f"confusion_matrix_{cfg.task}.png")
-            fig.savefig(cpath, dpi=140); plt.close(fig); paths.append(cpath)
-
-        lat = latency["_latencies"]
-        fig, ax = plt.subplots(figsize=(4.6, 3.2))
-        ax.hist(lat, bins=30, color="#2E6E8E", alpha=0.85)
-        ax.axvline(cfg.latency_budget_ms, color="#9E2B25", ls="--",
-                   label=f"budget {cfg.latency_budget_ms:g} ms")
-        ax.set_xlabel("decode latency (ms)"); ax.set_ylabel("count")
-        ax.set_title("Closed-loop decision latency"); ax.legend()
-        fig.tight_layout()
-        lpath = os.path.join(cfg.out_dir, f"latency_hist_{cfg.task}.png")
-        fig.savefig(lpath, dpi=140); plt.close(fig); paths.append(lpath)
-    except Exception as exc:  # plotting is optional
-        logging.getLogger("eeg_tvns").warning("Plotting skipped: %s", exc)
-    return paths
-
-
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s",
                         datefmt="%H:%M:%S")
-    log = logging.getLogger("eeg_tvns")
     cfg = parse_args()
-    os.makedirs(cfg.out_dir, exist_ok=True)
+    res = train(cfg)
 
-    # 1) data --------------------------------------------------------------
-    ep = load_dataset(cfg)
-
-    # 2) leakage-free evaluation ------------------------------------------
-    log.info("=== Cross-subject (leave-one-subject-out) ===")
-    xsub = evaluate_cross_subject(ep, cfg)
-    print(xsub.report())
-
-    log.info("=== Within-subject (per-patient calibration) ===")
-    wsub = evaluate_within_subject(ep, cfg)
-    print(wsub.report())
-
-    perm = None
-    if cfg.n_permutations > 0:
-        log.info("=== Empirical chance (label permutation) ===")
-        perm = permutation_chance(ep, cfg, n_perm=cfg.n_permutations)
+    for report in res.reports:
+        print(report)
+    perm = res.metrics.get("permutation") or {}
+    if perm.get("n_permutations"):
         print(f"[permutation] observed={perm['observed']:.3f}  "
               f"null={perm['null_mean']:.3f}+/-{perm['null_std']:.3f}  "
               f"p={perm['p_value']:.4f}")
-
-    # 3) fit the deployable model on ALL data -----------------------------
-    log.info("=== Fitting final model on all data ===")
-    model = build_pipeline(cfg)
-    model.fit(ep.X, ep.y)
-
-    # 4) closed-loop latency ----------------------------------------------
-    log.info("=== Real-time latency benchmark ===")
-    latency = benchmark_latency(model, ep, cfg)
-    print(f"[latency] median={latency['median_ms']:.2f} ms  p95={latency['p95_ms']:.2f} ms  "
-          f"within {cfg.latency_budget_ms:g} ms: {latency['fraction_within_budget']*100:.1f}%")
-
-    # 5) persist -----------------------------------------------------------
-    import joblib
-    model_path = os.path.join(cfg.out_dir, f"model_{cfg.task}.joblib")
-    joblib.dump({
-        "model": model,
-        "config": cfg,
-        "label_names": ep.label_names,
-        "ch_names": ep.ch_names,   # training channel order -> live channel remap
-        "sfreq": cfg.sfreq,        # training rate -> live resample target
-    }, model_path)
-
-    metrics = {
-        "task": cfg.task,
-        "condition": cfg.condition,
-        "classifier": cfg.classifier,
-        "align": cfg.align,
-        "n_channels": int(ep.X.shape[1]),
-        "n_trials": int(ep.X.shape[0]),
-        "n_subjects": int(len(np.unique(ep.subjects))),
-        "cross_subject_bacc_mean": xsub.mean,
-        "cross_subject_bacc_std": xsub.std,
-        "within_subject_bacc_mean": wsub.mean,
-        "within_subject_bacc_std": wsub.std,
-        "permutation": {k: v for k, v in (perm or {}).items()},
-        "latency": {k: v for k, v in latency.items() if not k.startswith("_")},
-    }
-    # Per-task filename: the go and word runs would otherwise clobber each other's
-    # results, silently leaving metrics that describe a different decoder.
-    metrics_path = os.path.join(cfg.out_dir, f"metrics_{cfg.task}.json")
-    with open(metrics_path, "w") as fh:
-        json.dump(metrics, fh, indent=2, default=float)
-
-    plots = maybe_plots(cfg, xsub, latency)
+    lat = res.metrics.get("latency") or {}
+    if lat:
+        print(f"[latency] median={lat['median_ms']:.2f} ms  p95={lat['p95_ms']:.2f} ms  "
+              f"within {cfg.latency_budget_ms:g} ms: "
+              f"{lat['fraction_within_budget']*100:.1f}%")
 
     print("\n" + "=" * 64)
-    print(f"Saved model  -> {model_path}")
-    print(f"Saved metrics-> {metrics_path}")
-    for pth in plots:
+    print(f"Saved model  -> {res.model_path}")
+    print(f"Saved metrics-> {res.metrics_path}")
+    for pth in res.plots:
         print(f"Saved plot   -> {pth}")
+    if res.verdict:
+        print(f"Gating       -> {res.verdict['label']}: {res.verdict['detail']}")
     print("=" * 64)
 
 

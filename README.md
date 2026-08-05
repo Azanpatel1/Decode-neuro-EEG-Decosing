@@ -64,6 +64,10 @@ python run.py --calibration 'calib/*.npz' --task go
 One recording gives you the within-subject number; cross-subject LOSO needs
 several subjects.
 
+You can also do all of this from the dashboard's **Calibrate** tab (section 7b),
+which presents the cues in the browser and records how late each one actually
+appeared, then train from it on the **Train** tab.
+
 ### 2b. Get ds003626 (for the word decoder)
 
 ```bash
@@ -117,9 +121,14 @@ the condition ({0,1,2}), band-passes 1–40 Hz, crops to the action window
 | File | Contents |
 |---|---|
 | `model_<task>.joblib` | the fitted, deployable pipeline + config + label names |
-| `metrics.json` | cross-subject / within-subject balanced accuracy, permutation p-value, latency |
-| `confusion_matrix.png` | normalised cross-subject confusion |
-| `latency_hist.png` | closed-loop decision latency vs. the VNS pairing budget |
+| `metrics_<task>.json` | cross-subject / within-subject balanced accuracy, permutation p-value, latency |
+| `confusion_matrix_<task>.png` | normalised cross-subject confusion |
+| `latency_hist_<task>.png` | closed-loop decision latency vs. the VNS pairing budget |
+| `session_log.jsonl` | dashboard audit trail: mode changes, arm/disarm, fires |
+| `impedance.json` | the most recent contact check, reused by the head map |
+
+Filenames carry the task so training a GO decoder cannot overwrite the word
+decoder's metrics.
 
 ## 5. Key options
 
@@ -138,8 +147,8 @@ the condition ({0,1,2}), band-passes 1–40 Hz, crops to the action window
 
 | Stage | Module | Notes |
 |---|---|---|
-| Preprocess (band-pass, crop) | `data_loader.py` | MNE with SciPy fallback |
-| Low-density montage | `data_loader.select_montage` | emulates the 8–16 ch wearable |
+| Preprocess (band-pass, crop) | `preprocessing.py` | shared by training and the live path |
+| Low-density montage | `data_loader.resolve_montage_indices` | picks 10-20 sites by 3D position, not by label |
 | Covariance | `pipeline.Covariances` / `FilterBankCovariances` | OAS-regularised |
 | **Riemannian Alignment** | `pipeline.RiemannianAlignment` | per-domain recentering; ≡ `pyriemann.transfer.TLCenter` |
 | Tangent space | `pipeline.TangentSpace` | |
@@ -147,6 +156,12 @@ the condition ({0,1,2}), band-passes 1–40 Hz, crops to the action window
 | Leakage-free eval | `evaluate.py` | LOSO + within-subject + permutation chance |
 | Closed-loop GO gate | `realtime.RealTimeDecoder` | GO threshold + online recentering |
 | Latency benchmark | `realtime.benchmark_latency` | proves compute fits the pairing window |
+| Training entry point | `training.train` | one path shared by `run.py` and the dashboard |
+| Hardware ownership + ARM | `session.SessionManager` | exclusive board modes, audit log |
+| Background jobs | `jobs.JobRunner` | training off the request thread, with progress |
+| Model registry + verdicts | `models.py` | is this bundle fit to gate stimulation? |
+| Board registry / probing | `boards.py` | port enumeration, board IDs, error explanations |
+| Live display plumbing | `live.py` | `FrameHub`, acquisition thread, word readout |
 
 ## 7. Live hardware acquisition (OpenBCI Cyton+Daisy)
 
@@ -176,46 +191,106 @@ The board runs at 125 Hz while the model trains at 256 Hz; by default each windo
 is resampled to the model rate so features line up. For the cleanest match,
 calibrate/train a model at the board's rate (`Config.sfreq = 125`).
 
-## 7b. Live browser dashboard
+## 7b. The dashboard (full control plane)
 
-For a real-time monitor of the EEG traces and the decoder's output, use
-`dashboard.py`. It runs the same closed loop as `acquisition.py` and streams
-each decode to a browser UI over a WebSocket.
+The dashboard is the whole workflow in a browser: find the board, check electrode
+contact, record calibration, train a decoder, assign it, run the closed loop, and
+watch it. It boots with **nothing connected** and acquires hardware only when you
+ask it to, so `--port` and `--model` are just conveniences that pre-fill the form.
 
 ```bash
 pip install "fastapi>=0.110,<0.120" "uvicorn>=0.27,<0.35" "websockets>=12"
+pip install pyserial   # optional: nicer port names; otherwise ports are globbed
 
-python dashboard.py --port /dev/cu.usbserial-XXXX --model outputs/model_go.joblib
+python dashboard.py                      # then do everything in the browser
 ```
+
+Open http://127.0.0.1:8765. Five tabs:
+
+| Tab | What you can do |
+|---|---|
+| **Monitor** | live traces, GO state and `p(go)`, the decoded window behind the last GO event, word readout, `p(go)` and latency history, electrode head map |
+| **Hardware** | enumerate serial ports, probe a board (reports real EEG channel count and sample rate), set the channel labels, start/stop the closed loop, run a contact check with real ADS1299 impedance, **ARM / DISARM** stimulation |
+| **Calibrate** | record same-session interleaved attempt/rest with cues presented in the browser; shows measured cue display lag and lists past recordings |
+| **Train** | run the same training pipeline as `run.py` as a background job, with live progress, the pipeline's own log lines, metrics and plots |
+| **Models** | list every bundle in `outputs/` with its task, montage, rate, LOSO score and **gating verdict**; import a `.joblib`; assign it to the GO or word slot |
+
+The serial port is exclusive, so one activity owns the board at a time: probing,
+a contact check, calibration and decoding cannot overlap. A request that arrives
+while another holds the board is refused (HTTP 409) rather than queued, and the
+tab tells you what to stop first. Every mode change, arm, disarm and fire is
+appended to `outputs/session_log.jsonl`.
 
 Every trace it draws is measured from the board. Because there is no simulated
 source, an empty or flatlined chart always means a real acquisition problem
-(board off, port busy, electrodes not seated) — never synthetic filler.
+(board off, port busy, electrodes not seated) — never synthetic filler. If
+acquisition can't start, a red banner explains what to fix.
 
-Open http://127.0.0.1:8765. Panels:
+### Stimulation is behind an ARM switch
 
-| Panel | Shows |
-|---|---|
-| Live EEG traces | 16-channel rolling strip chart (last 6 s), red line at each tVNS fire |
-| **Decoded window that fired tVNS** | the *frozen* window that actually crossed threshold, with its `p(go)`, threshold, and age -- the evidence behind the stimulation |
-| GO decoder | GO/IDLE state, `p(go)`, active threshold, fire and decision counts |
-| **Word decode** | 4-class attempt identity (up / down / right / left) with per-class probability bars |
-| p(go) history | `p(go)` over time with the threshold line |
-| Latency | decision latency against the 300 ms pairing budget |
+Running the loop and firing a nerve stimulator are separate decisions. The loop
+always starts **DISARMED**: it decodes, displays, and logs GO events without
+triggering anything. Arming requires all of:
 
-The **word decode is display only**. It loads `outputs/model_word.joblib` (train
-with `python run.py --data ./ds003626 --task word`) and runs inside the dashboard's
-observer callback -- *after* `run_loop` has already made its GO decision -- so it
-has no path back into the stimulation trigger (Invariant C). It is decoded only
-on GO frames, since word identity during rest is meaningless. Disable with
-`--word-model none`; a missing model just greys the panel out.
+- the closed loop already running,
+- the server bound to loopback (`--allow-remote-arm` to override; the default host
+  is `127.0.0.1`),
+- the GO model's filename typed back exactly, so it cannot be a stray click,
+- an explicit acknowledgement when that model is **not validated for gating**.
 
-If acquisition can't start (e.g. Cyton powered off, or the OpenBCI GUI holding
-the port), a red banner explains what to fix instead of showing silent flatlines.
+It auto-disarms on stop, on any GO-model change or rewrite, and after 30 minutes.
+
+The Monitor tab therefore counts **GO events** and **stimulations** separately: a
+threshold crossing while disarmed is a GO event and is drawn amber, while a real
+stimulation is drawn red. The display never implies the patient was stimulated
+when they were not.
+
+`models.py` flags a bundle trained from ds003626 with a GO task as *not validated
+for gating*, because its rest class is a separate baseline block (section 9). That
+is exactly the `outputs/model_go.joblib` you get from section 3, so arming it
+takes a deliberate acknowledgement.
+
+### The word decoder cannot gate, structurally
+
+It runs in the `on_frame` observer, *after* `run_loop` has already acted on its GO
+decision, so it has no path into the trigger. The API additionally refuses to put
+a `task == "word"` bundle in the GO slot at all (Invariant C enforced server-side,
+not by convention). It is decoded only on GO frames, since word identity during
+rest is meaningless.
+
+### Calibration cue timing is measured, not assumed
+
+The server plans the entire cue timeline as absolute times and sends it to the
+browser; the browser syncs clocks against `/api/time` over several round trips
+(keeping the minimum-RTT sample), pre-schedules every cue locally so no per-cue
+network jitter exists, and reports back when each cue was actually painted. An
+onset within tolerance of plan replaces the planned onset; one that is absurd
+(before its cue, or very late) keeps the planned onset and is flagged. Per-trial
+`display_lag_s` goes into the `.npz` and the tab shows the median and worst lag.
+
+### Training goes through one code path
+
+`run.py` and the Train tab both call `eeg_tvns.training.train()`, so a model
+trained in the browser is the same model the CLI would produce. Training is
+refused while the loop is decoding — a multi-minute fit must never compete for CPU
+with the decoder that gates stimulation.
 
 Extra flags: `--word-model`, `--host`, `--web-port`, `--publish-hz` (UI refresh
-rate; the decoder always runs at its native `hop_s`). All acquisition flags are
+rate; the decoder always runs at its native `hop_s`), `--allow-remote-arm`,
+`--start` (start the loop immediately; still disarmed). All acquisition flags are
 supported.
+
+### Checking it without hardware
+
+```bash
+python tools/verify_control_plane.py
+```
+
+Exercises the mode state machine and its 409s, every ARM refusal, Invariant C at
+the API, the cue timeline and lag arithmetic, the job runner, model verdicts, and
+the guarantee that nothing in the package can fabricate a signal. Board-dependent
+paths run against a transport double that emits an obvious ramp, never anything
+EEG-like. No network, no hardware.
 
 ## 8. Using the trained model directly in your own loop
 
@@ -270,5 +345,11 @@ print(d.probability, d.latency_ms)
   it detects "is there any learnable structure" — and block identity *is*
   learnable structure. Passing at p=0.005 says nothing about *what* was learned.
   A same-block control is the check that matters.
+- **The dashboard can arm a stimulator.** That is the point of the ARM switch, the
+  loopback restriction, the typed confirmation and the gating verdict (section 7b):
+  the default state is that nothing fires. Before arming anything on a person,
+  have a GO model trained from your own calibration data and reported against the
+  0.54 same-block control, and keep `fire_tvns()` wired to a device you can cut
+  power to.
 - **Label columns:** auto-detection is robust but verify the printed class
   distribution on your first real run; override in `_autodetect_columns` if needed.

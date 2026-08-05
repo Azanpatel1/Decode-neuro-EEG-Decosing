@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>eeg_tvns control plane</title>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<header>
+  <h1>eeg_tvns</h1>
+  <nav class="tabs" id="tabs">
+    <button data-view="monitor" class="active">Monitor</button>
+    <button data-view="hardware">Hardware</button>
+    <button data-view="calibrate">Calibrate</button>
+    <button data-view="train">Train</button>
+    <button data-view="models">Models</button>
+  </nav>
+  <div class="meta">
+    <span id="sessionState">-</span>
+    <span id="source">-</span>
+    <span id="model">-</span>
+    <span id="wordModel">-</span>
+    <span id="channels">-</span>
+    <span><span class="dot" id="connDot"></span><span id="conn">connecting</span></span>
+  </div>
+</header>
+<div id="banner"></div>
+
+<main>
+  <!-- ============================================================ MONITOR -->
+  <section class="view active" id="view-monitor">
+    <div class="leftCol">
+      <section id="eegPanel" class="panel">
+        <h2>Live EEG traces <span class="note">rolling <b id="bufLen">6</b> s &middot;
+          <span style="color:var(--danger)">red</span> = stimulation,
+          <span style="color:var(--go)">amber</span> = GO event suppressed</span></h2>
+        <canvas id="eeg"></canvas>
+      </section>
+      <section id="trigPanel" class="panel">
+        <h2>
+          Decoded window behind the last GO event
+          <span class="note" id="trigMeta">awaiting first GO event</span>
+        </h2>
+        <canvas id="trig"></canvas>
+      </section>
+      <div class="chartsRow">
+        <section id="pgoPanel" class="panel">
+          <h2>p(go) history</h2>
+          <canvas id="pgo_chart"></canvas>
+        </section>
+        <section id="latPanel" class="panel">
+          <h2>Latency vs 300 ms budget</h2>
+          <canvas id="lat_chart"></canvas>
+        </section>
+      </div>
+    </div>
+    <div class="rightCol">
+      <section class="panel go-wrap">
+        <h2>GO decoder <span class="note" id="goNote">gates stimulation</span></h2>
+        <div id="goInd" class="go-indicator">IDLE</div>
+        <div id="fireFlash" class="fire-flash"></div>
+        <div class="stats">
+          <div class="stat"><div class="k">p(go)</div><div class="v" id="pgo">0.000</div></div>
+          <div class="stat"><div class="k">Threshold</div><div class="v" id="thresh">0.50</div></div>
+          <div class="stat"><div class="k">GO events</div><div class="v" id="goEvents">0</div></div>
+          <div class="stat"><div class="k">Stimulations</div><div class="v" id="stims">0</div></div>
+        </div>
+        <div class="disclaimer" id="goStatNote">
+          A GO event is a threshold crossing past the refractory window. It only
+          becomes a stimulation while armed.
+        </div>
+      </section>
+      <section class="panel">
+        <h2>Word decode <span class="note">display only</span></h2>
+        <div id="wordHero" class="word-hero idle">no word model</div>
+        <div class="bars" id="wordBars"></div>
+        <div class="disclaimer" id="wordNote">
+          4-class attempt identity, decoded only while GO is active.
+          Never gates stimulation.
+        </div>
+      </section>
+      <section id="headPanel" class="panel">
+        <h2>Electrode contact <span class="note" id="headMeta">live</span></h2>
+        <canvas id="head"></canvas>
+        <div class="legend">
+          <span><i class="sw good"></i>good</span>
+          <span><i class="sw ok"></i>marginal</span>
+          <span><i class="sw bad"></i>bad</span>
+          <span><i class="sw unknown"></i>no data</span>
+        </div>
+        <div id="headTip" class="disclaimer">
+          Hover an electrode for its measured values.
+        </div>
+        <div id="impNote" class="disclaimer"></div>
+      </section>
+    </div>
+  </section>
+
+  <!-- =========================================================== HARDWARE -->
+  <section class="view scroll" id="view-hardware">
+    <div class="grid2">
+      <section class="panel">
+        <h2>Board <span class="note" id="hwState">idle</span></h2>
+        <label class="field" for="hwPort">Serial port</label>
+        <div class="row">
+          <select id="hwPort"><option value="">(scanning…)</option></select>
+          <button class="btn" id="hwRescan" style="flex:0 0 auto">Rescan</button>
+        </div>
+        <label class="field" for="hwBoard">Board</label>
+        <select id="hwBoard"></select>
+        <div class="hint">Cyton alone exposes 8 channels; Cyton+Daisy exposes 16 at
+          125 Hz. Picking the wrong one makes every channel index wrong.</div>
+        <label class="field" for="hwChannels">Channel names, in board order</label>
+        <textarea id="hwChannels" spellcheck="false"></textarea>
+        <div class="hint">One label per board channel. Position 1 is what is plugged
+          into channel 1. These become the montage of anything you record.</div>
+        <div class="btnrow">
+          <button class="btn" id="hwProbe">Probe board</button>
+          <button class="btn primary" id="hwStart">Start closed loop</button>
+          <button class="btn danger" id="hwStop">Stop</button>
+        </div>
+        <div class="hint" id="hwProbeOut"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Stimulation <span class="note">tVNS output</span></h2>
+        <div class="arm" id="armBox">
+          <div class="state safe" id="armState">DISARMED</div>
+          <div class="hint" id="armWhy">While disarmed the loop decodes and displays
+            but never triggers the stimulator.</div>
+          <div class="btnrow">
+            <button class="btn danger" id="armBtn">Arm</button>
+            <button class="btn" id="disarmBtn">Disarm</button>
+          </div>
+        </div>
+        <div class="stats" style="margin-top:12px">
+          <div class="stat"><div class="k">GO model</div><div class="v" id="armModel" style="font-size:12px">-</div></div>
+          <div class="stat"><div class="k">Gating verdict</div><div class="v" id="armVerdict" style="font-size:12px">-</div></div>
+        </div>
+        <div class="disclaimer" id="armNote"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Contact check <span class="note" id="scNote">impedance + live signal</span></h2>
+        <div class="row">
+          <div>
+            <label class="field" for="scLine">Mains (Hz)</label>
+            <select id="scLine"><option value="60">60 (US)</option><option value="50">50 (EU)</option></select>
+          </div>
+          <div>
+            <label class="field" for="scInput">Test input</label>
+            <select id="scInput"><option value="n">N</option><option value="p">P</option></select>
+          </div>
+          <div>
+            <label class="field" for="scImp">Impedance</label>
+            <select id="scImp"><option value="1">measure</option><option value="0">skip</option></select>
+          </div>
+        </div>
+        <div class="hint">Impedance injects 6 nA at 31.2 Hz one channel at a time, so
+          the board is not reading EEG during it. Takes about 3 s per channel.</div>
+        <div class="btnrow">
+          <button class="btn primary" id="scRun">Run check</button>
+        </div>
+        <div class="prog" id="scProgWrap" hidden><div class="fill" id="scProg"></div></div>
+        <div id="scStatus" class="hint"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Head map <span class="note" id="headMetaBig">awaiting data</span></h2>
+        <canvas id="headBig"></canvas>
+        <div class="legend">
+          <span><i class="sw good"></i>good</span>
+          <span><i class="sw ok"></i>marginal</span>
+          <span><i class="sw bad"></i>bad</span>
+          <span><i class="sw unknown"></i>no data</span>
+        </div>
+        <div id="headTipBig" class="disclaimer">Hover an electrode for its measured values.</div>
+      </section>
+
+      <section class="panel" style="grid-column: 1 / -1">
+        <h2>Per-electrode measurements</h2>
+        <div id="scTable"><div class="empty">No measurements yet. Run a contact check.</div></div>
+      </section>
+    </div>
+  </section>
+
+  <!-- ========================================================== CALIBRATE -->
+  <section class="view scroll" id="view-calibrate">
+    <div class="grid2">
+      <section class="panel">
+        <h2>Recording setup <span class="note" id="calState">idle</span></h2>
+        <div class="row">
+          <div>
+            <label class="field" for="calSubject">Subject</label>
+            <input type="number" id="calSubject" value="1" min="1" />
+          </div>
+          <div>
+            <label class="field" for="calSession">Session</label>
+            <input type="number" id="calSession" value="1" min="1" />
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label class="field" for="calTrials">Trials per class</label>
+            <input type="number" id="calTrials" value="40" min="2" />
+          </div>
+          <div>
+            <label class="field" for="calAction">Action window (s)</label>
+            <input type="number" id="calAction" value="2.5" step="0.1" min="0.5" />
+          </div>
+        </div>
+        <div class="hint" id="calEstimate"></div>
+        <div class="hint">Attempt and rest are interleaved in one recording with runs
+          capped at 3, so slow drift cannot line up with class identity. That is what
+          makes the resulting GO score mean "speech attempt" rather than "which block".</div>
+        <div class="btnrow">
+          <button class="btn primary" id="calStart">Start recording</button>
+          <button class="btn danger" id="calAbort">Abort</button>
+        </div>
+        <div class="hint" id="calMsg"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Cue <span class="note" id="calClock">clock not synced</span></h2>
+        <div class="cue" id="cueBox">
+          <div class="kind" id="cueKind">not recording</div>
+          <div class="text" id="cueText">—</div>
+          <div class="count" id="cueCount"></div>
+        </div>
+        <div class="prog" id="calProgWrap" hidden><div class="fill" id="calProg"></div></div>
+        <div class="hint" id="calLag"></div>
+      </section>
+
+      <section class="panel" style="grid-column: 1 / -1">
+        <h2>Recordings <span class="note">calib/*.npz</span></h2>
+        <div id="calList"><div class="empty">No recordings yet.</div></div>
+      </section>
+    </div>
+  </section>
+
+  <!-- ============================================================== TRAIN -->
+  <section class="view scroll" id="view-train">
+    <div class="grid2">
+      <section class="panel">
+        <h2>Training run <span class="note" id="trainState">idle</span></h2>
+        <label class="field" for="trSource">Data source</label>
+        <select id="trSource">
+          <option value="calibration">My calibration recordings (for the GO decoder)</option>
+          <option value="data">ds003626 (for the word decoder / research)</option>
+        </select>
+        <label class="field" for="trPath">Path or glob</label>
+        <input type="text" id="trPath" value="calib/*.npz" spellcheck="false" />
+        <div class="row">
+          <div>
+            <label class="field" for="trTask">Task</label>
+            <select id="trTask">
+              <option value="go">go (gates tVNS)</option>
+              <option value="word">word (display only)</option>
+            </select>
+          </div>
+          <div>
+            <label class="field" for="trClf">Classifier</label>
+            <select id="trClf">
+              <option value="lda">lda</option><option value="logreg">logreg</option>
+              <option value="mdm">mdm</option><option value="svm">svm</option>
+            </select>
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label class="field" for="trCond">Condition (ds003626)</label>
+            <select id="trCond">
+              <option value="inner">inner</option>
+              <option value="pronounced">pronounced</option>
+              <option value="visualized">visualized</option>
+              <option value="overt_scaffold">overt_scaffold</option>
+            </select>
+          </div>
+          <div>
+            <label class="field" for="trPerm">Permutations</label>
+            <input type="number" id="trPerm" value="50" min="0" />
+          </div>
+        </div>
+        <div class="hint">Permutations dominate run time and give the empirical chance
+          level. 0 skips it, but then any accuracy you get has no baseline to compare
+          against. 200+ is publication grade.</div>
+        <label class="field"><input type="checkbox" id="trAlign" checked style="width:auto" />
+          Riemannian alignment (uncheck for the ablation)</label>
+        <div class="btnrow">
+          <button class="btn primary" id="trStart">Start training</button>
+          <button class="btn danger" id="trCancel">Cancel</button>
+        </div>
+        <div class="prog" id="trProgWrap" hidden><div class="fill" id="trProg"></div></div>
+        <div class="hint" id="trStage"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Log</h2>
+        <div class="console" id="trLog">No training run yet.</div>
+      </section>
+
+      <section class="panel" style="grid-column: 1 / -1">
+        <h2>Results <span class="note" id="trResultNote"></span></h2>
+        <div id="trResults"><div class="empty">No results yet.</div></div>
+      </section>
+    </div>
+  </section>
+
+  <!-- ============================================================= MODELS -->
+  <section class="view scroll" id="view-models">
+    <div class="grid2">
+      <section class="panel" style="grid-column: 1 / -1">
+        <h2>Available decoders <span class="note" id="mdNote"></span></h2>
+        <div id="mdTable"><div class="empty">Scanning…</div></div>
+      </section>
+      <section class="panel">
+        <h2>Import a model</h2>
+        <div class="hint">Upload a joblib bundle produced by this pipeline. It must
+          contain the model, its Config, channel names and sample rate, or the live
+          path cannot map your board onto it.</div>
+        <label class="field" for="mdFile">File</label>
+        <input type="file" id="mdFile" accept=".joblib" />
+        <div class="btnrow">
+          <button class="btn primary" id="mdUpload">Upload</button>
+        </div>
+        <div class="hint" id="mdUploadOut"></div>
+      </section>
+      <section class="panel">
+        <h2>Slots</h2>
+        <div class="stats">
+          <div class="stat"><div class="k">GO slot &mdash; gates tVNS</div>
+            <div class="v" id="mdGo" style="font-size:12px">-</div></div>
+          <div class="stat"><div class="k">Word slot &mdash; display only</div>
+            <div class="v" id="mdWord" style="font-size:12px">-</div></div>
+        </div>
+        <div class="disclaimer">A word decoder can never be assigned to the GO slot.
+          Multi-class attempt identity is unreliable in patients, so stimulation
+          timing comes from the binary GO decoder only.</div>
+      </section>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div id="lat">latency last / median / p95: -</div>
+  <div id="footNote">hop-driven UI; decoder runs at its native rate</div>
+</footer>
+<script src="/static/app.js"></script>
+</body>
+</html>

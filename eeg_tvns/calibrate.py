@@ -48,6 +48,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from .boards import DEFAULT_BOARD, resolve_board_id
 from .config import CLASS_NAMES, Config
 
 log = logging.getLogger("eeg_tvns.calibrate")
@@ -63,6 +64,15 @@ class Trial:
     kind: int                      # REST or ATTEMPT
     word: Optional[int] = None     # 0..3 index into CLASS_NAMES, attempts only
     onset_unix: Optional[float] = None   # wall-clock time the action window began
+    # Pre-scheduled runs only: when the cue was *planned* to appear, how late it
+    # actually appeared, and whether that lag was too large to trust. Recorded so
+    # cue/EEG misalignment is measured rather than assumed (see plan_timeline).
+    planned_unix: Optional[float] = None
+    display_lag_s: Optional[float] = None
+    lag_flagged: bool = False
+
+    def label(self) -> str:
+        return "REST" if self.kind == REST else f"SPEAK ALOUD: {CLASS_NAMES[self.word]}"
 
 
 @dataclass
@@ -146,9 +156,11 @@ class BoardRecorder:
     sample indices afterwards rather than relying on polling granularity.
     """
 
-    def __init__(self, serial_port: str, poll_s: float = 0.2):
+    def __init__(self, serial_port: str, poll_s: float = 0.2,
+                 board: str = DEFAULT_BOARD):
         self.serial_port = serial_port
         self.poll_s = poll_s
+        self.board_name = board
         self._chunks: List[np.ndarray] = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -158,9 +170,9 @@ class BoardRecorder:
         self.ts_row: int = -1
 
     def __enter__(self) -> "BoardRecorder":
-        from brainflow.board_shim import BoardIds, BoardShim, BrainFlowInputParams
+        from brainflow.board_shim import BoardShim, BrainFlowInputParams
 
-        self.board_id = BoardIds.CYTON_DAISY_BOARD
+        self.board_id = resolve_board_id(self.board_name)
         params = BrainFlowInputParams()
         params.serial_port = self.serial_port
         self.board = BoardShim(self.board_id, params)
@@ -221,11 +233,14 @@ def epoch_by_onsets(
     not depend on how often the recorder thread happened to poll. Trials whose
     window runs past the end of the recording are dropped with a warning rather
     than zero-padded -- padding would invent samples.
+
+    Returns (X, y_go, y_word, kept_indices); `kept_indices` indexes into `trials`
+    so per-trial metadata can be aligned with the epochs that survived.
     """
     n_samp = int(round(action_s * sfreq))
-    Xs, y_go, y_word = [], [], []
+    Xs, y_go, y_word, kept = [], [], [], []
     dropped = 0
-    for t in trials:
+    for i, t in enumerate(trials):
         if t.onset_unix is None:
             dropped += 1
             continue
@@ -236,11 +251,13 @@ def epoch_by_onsets(
         Xs.append(raw[:, i0:i0 + n_samp])
         y_go.append(t.kind)
         y_word.append(-1 if t.word is None else int(t.word))
+        kept.append(i)
     if dropped:
         log.warning("Dropped %d trial(s) that ran past the end of the recording.", dropped)
     if not Xs:
         raise ValueError("No complete trials were recorded.")
-    return np.stack(Xs), np.asarray(y_go, int), np.asarray(y_word, int)
+    return (np.stack(Xs), np.asarray(y_go, int), np.asarray(y_word, int),
+            np.asarray(kept, int))
 
 
 def save_calibration(
@@ -254,13 +271,27 @@ def save_calibration(
     session: int,
     action_s: float,
     paradigm: str = "overt",
+    cue_source: str = "terminal",
+    display_lag_s: Optional[np.ndarray] = None,
+    lag_flagged: Optional[np.ndarray] = None,
 ) -> None:
-    """Write one calibration recording (raw, unfiltered, board-rate)."""
+    """Write one calibration recording (raw, unfiltered, board-rate).
+
+    `display_lag_s` is per trial and only present for browser-cued runs: how much
+    later than planned each cue actually appeared. It is stored rather than
+    averaged away so anyone re-analysing the file can see how well cue and EEG
+    were aligned instead of trusting that they were.
+    """
     if X.shape[1] != len(ch_names):
         raise ValueError(
             f"{X.shape[1]} channels recorded but {len(ch_names)} names given. "
             "Channel names must describe the board in board order."
         )
+    n = len(X)
+    lag = (np.full(n, np.nan) if display_lag_s is None
+           else np.asarray(display_lag_s, dtype=float))
+    flag = (np.zeros(n, dtype=bool) if lag_flagged is None
+            else np.asarray(lag_flagged, dtype=bool))
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     np.savez_compressed(
         path,
@@ -275,7 +306,14 @@ def save_calibration(
         paradigm=paradigm,
         filtered=False,
         created_unix=time.time(),
+        cue_source=cue_source,
+        display_lag_s=lag,
+        lag_flagged=flag,
     )
+    n_flag = int(flag.sum())
+    if n_flag:
+        log.warning("%d trial(s) had an untrustworthy cue-display report and kept "
+                    "their planned onset.", n_flag)
     log.info("Saved %s: %d trials (%d attempt / %d rest), %d ch @ %.0f Hz.",
              path, len(X), int((y_go == ATTEMPT).sum()), int((y_go == REST).sum()),
              X.shape[1], sfreq)
@@ -288,6 +326,8 @@ def check_signal(
     line_freq: Optional[float] = 60.0,
     impedance: bool = True,
     impedance_input: str = "n",
+    board: str = DEFAULT_BOARD,
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
 ) -> List:
     """Report contact quality per electrode before a session.
 
@@ -298,14 +338,25 @@ def check_signal(
     """
     from .signal_quality import live_quality, measure_impedance, merge_quality
 
-    with BoardRecorder(serial_port) as rec:
+    n_ch = len(ch_names)
+    total = n_ch + 1 if impedance else 1
+
+    def tick(done: int, stage: str) -> None:
+        if on_progress is not None:
+            try:
+                on_progress(done, total, stage)
+            except Exception:
+                log.exception("signal-check progress callback failed; continuing")
+
+    with BoardRecorder(serial_port, board=board) as rec:
         n_board_ch = len(rec.eeg_rows)
-        if n_board_ch != len(ch_names):
+        if n_board_ch != n_ch:
             raise ValueError(
-                f"Board exposes {n_board_ch} EEG channels but {len(ch_names)} "
+                f"Board exposes {n_board_ch} EEG channels but {n_ch} "
                 "names were given. Pass one label per board channel, in board order."
             )
         log.info("Collecting %.1f s of EEG for signal metrics…", seconds)
+        tick(0, f"collecting {seconds:.0f} s of EEG")
         time.sleep(seconds)
         data = rec.collected()
         if data.size == 0:
@@ -316,28 +367,36 @@ def check_signal(
         window = data[rec.eeg_rows, :]
         live = live_quality(window, rec.sfreq, ch_names, line_freq=line_freq)
 
+        tick(1, "measuring impedance" if impedance else "done")
         if impedance:
             log.info("Measuring impedance (injects 6 nA @ 31.2 Hz, one channel at "
                      "a time; not EEG during this phase)…")
+
+            def imp_tick(i: int, name: str) -> None:
+                tick(1 + i, f"impedance on {name} ({i + 1}/{n_ch})")
+
             imp = measure_impedance(rec.board, rec.eeg_rows, rec.sfreq, ch_names,
-                                    input_side=impedance_input)
+                                    input_side=impedance_input, on_channel=imp_tick)
             live = merge_quality(live, imp)
+        tick(total, "done")
     return live
 
 
-def run_calibration(
+def _record(
     serial_port: str,
     schedule: CueSchedule,
     ch_names: List[str],
-    present: Callable[[str, str, float], None],
-    settle_s: float = 3.0,
+    drive: Callable[[BoardRecorder], None],
+    board: str = DEFAULT_BOARD,
+    tail_s: float = 0.5,
 ) -> Dict:
-    """Record the schedule from the board, returning epoched raw data.
+    """Open the board, let `drive` present the run, then epoch what was recorded.
 
-    `present(kind, text, seconds)` displays a cue; it is injected so the recorder
-    stays free of I/O and the CLI owns presentation.
+    Shared by both cue drivers (terminal and pre-scheduled browser) so the part
+    that touches hardware and cuts epochs exists exactly once. `drive` is
+    responsible only for presenting cues and stamping each trial's `onset_unix`.
     """
-    with BoardRecorder(serial_port) as rec:
+    with BoardRecorder(serial_port, board=board) as rec:
         if rec.sfreq <= 0:
             raise RuntimeError("Board reported a non-positive sampling rate.")
         n_board_ch = len(rec.eeg_rows)
@@ -348,25 +407,10 @@ def run_calibration(
                 "board order."
             )
 
-        present("settle", "Sit still — letting the amplifier settle", settle_s)
-        time.sleep(settle_s)
-
-        rng = np.random.default_rng(0)
-        for i, t in enumerate(schedule.trials, 1):
-            label = "REST" if t.kind == REST else f"SPEAK ALOUD: {CLASS_NAMES[t.word]}"
-            present("prepare", f"[{i}/{len(schedule.trials)}] get ready", schedule.prepare_s)
-            time.sleep(schedule.prepare_s)
-
-            t.onset_unix = time.time()
-            present("action", label, schedule.action_s)
-            time.sleep(schedule.action_s)
-
-            iti = float(rng.uniform(*schedule.iti_range_s))
-            present("rest", "relax", iti)
-            time.sleep(iti)
+        drive(rec)
 
         # Let the tail of the last window arrive before draining.
-        time.sleep(0.5)
+        time.sleep(tail_s)
         data = rec.collected()
         if data.size == 0:
             raise RuntimeError(
@@ -377,6 +421,184 @@ def run_calibration(
         ts = data[rec.ts_row, :]
         sfreq = rec.sfreq
 
-    X, y_go, y_word = epoch_by_onsets(raw, ts, schedule.trials, schedule.action_s, sfreq)
+    X, y_go, y_word, kept = epoch_by_onsets(
+        raw, ts, schedule.trials, schedule.action_s, sfreq)
+    lags = np.array([
+        np.nan if schedule.trials[i].display_lag_s is None
+        else schedule.trials[i].display_lag_s for i in kept], dtype=float)
+    flagged = np.array([schedule.trials[i].lag_flagged for i in kept], dtype=bool)
     return {"X": X, "y_go": y_go, "y_word": y_word, "sfreq": sfreq,
-            "ch_names": list(ch_names), "action_s": schedule.action_s}
+            "ch_names": list(ch_names), "action_s": schedule.action_s,
+            "display_lag_s": lags, "lag_flagged": flagged}
+
+
+def run_calibration(
+    serial_port: str,
+    schedule: CueSchedule,
+    ch_names: List[str],
+    present: Callable[[str, str, float], None],
+    settle_s: float = 3.0,
+    board: str = DEFAULT_BOARD,
+) -> Dict:
+    """Record the schedule from the board, returning epoched raw data.
+
+    `present(kind, text, seconds)` displays a cue; it is injected so the recorder
+    stays free of I/O and the CLI owns presentation. Each onset is stamped when
+    the cue is issued, which is right for a terminal where printing is immediate.
+    """
+    def drive(rec: BoardRecorder) -> None:
+        present("settle", "Sit still — letting the amplifier settle", settle_s)
+        time.sleep(settle_s)
+
+        rng = np.random.default_rng(0)
+        for i, t in enumerate(schedule.trials, 1):
+            present("prepare", f"[{i}/{len(schedule.trials)}] get ready", schedule.prepare_s)
+            time.sleep(schedule.prepare_s)
+
+            t.onset_unix = time.time()
+            present("action", t.label(), schedule.action_s)
+            time.sleep(schedule.action_s)
+
+            iti = float(rng.uniform(*schedule.iti_range_s))
+            present("rest", "relax", iti)
+            time.sleep(iti)
+
+    return _record(serial_port, schedule, ch_names, drive, board=board)
+
+
+# ---------------------------------------------------------------------------
+# Pre-scheduled cues, for a browser front end
+# ---------------------------------------------------------------------------
+# A browser cannot be cued per trial over the network without inheriting the
+# network's jitter into the epoch boundaries. So the server plans the whole run as
+# absolute wall-clock times up front, the browser syncs its clock once and
+# schedules every cue locally, and then reports back when each cue was actually
+# painted. The onset used for epoching is the *reported paint time* when it is
+# credible, and the planned time otherwise -- with the difference recorded per
+# trial, so cue/EEG alignment is a measured number in the file rather than an
+# assumption.
+DISPLAY_TOLERANCE_S = 0.5
+
+
+@dataclass
+class Timeline:
+    """Absolute times for a whole run, handed to the browser as the cue script."""
+
+    id: str
+    start_at: float          # settle cue appears
+    settle_until: float      # first trial's prepare begins
+    end_at: float
+    rows: List[Dict] = field(default_factory=list)
+
+    def to_dict(self) -> Dict:
+        return {"id": self.id, "start_at": self.start_at,
+                "settle_until": self.settle_until, "end_at": self.end_at,
+                "trials": self.rows}
+
+
+def plan_timeline(schedule: CueSchedule, start_at: float, settle_s: float = 3.0,
+                  seed: int = 0) -> Timeline:
+    """Lay the schedule out on the wall clock, ITIs included.
+
+    Also seeds each trial's `onset_unix` with its planned time, so a run whose
+    paint reports never arrive still epochs at sensible boundaries instead of
+    dropping every trial.
+    """
+    rng = np.random.default_rng(seed)
+    t = start_at + settle_s
+    rows: List[Dict] = []
+    for i, tr in enumerate(schedule.trials):
+        prepare_at = t
+        action_at = prepare_at + schedule.prepare_s
+        iti_at = action_at + schedule.action_s
+        t = iti_at + float(rng.uniform(*schedule.iti_range_s))
+        tr.planned_unix = action_at
+        tr.onset_unix = action_at
+        tr.display_lag_s = None
+        tr.lag_flagged = False
+        rows.append({"index": i, "kind": int(tr.kind), "word": tr.word,
+                     "label": tr.label(), "prepare_at": prepare_at,
+                     "action_at": action_at, "iti_at": iti_at})
+    return Timeline(id=f"{start_at:.3f}-{len(schedule.trials)}", start_at=start_at,
+                    settle_until=start_at + settle_s, end_at=t, rows=rows)
+
+
+class ScheduledCueRun:
+    """Accepts paint reports for a planned timeline and tracks the display lag."""
+
+    def __init__(self, schedule: CueSchedule, timeline: Timeline,
+                 tolerance_s: float = DISPLAY_TOLERANCE_S):
+        self.schedule = schedule
+        self.timeline = timeline
+        self.tolerance_s = tolerance_s
+        self._lock = threading.Lock()
+        self.n_reported = 0
+        self.n_flagged = 0
+
+    def report_paint(self, index: int, shown_at: float) -> None:
+        """Record when the browser actually painted trial `index`'s action cue."""
+        if not (0 <= index < len(self.schedule.trials)):
+            return
+        tr = self.schedule.trials[index]
+        if tr.planned_unix is None:
+            return
+        lag = shown_at - tr.planned_unix
+        with self._lock:
+            tr.display_lag_s = lag
+            # A cue cannot genuinely appear before it was scheduled, and a very
+            # late one means the tab was throttled or the clocks disagree. Either
+            # way the report is not evidence, so keep the planned onset and flag it.
+            if -0.05 <= lag <= self.tolerance_s:
+                tr.onset_unix = shown_at
+                tr.lag_flagged = False
+            else:
+                tr.onset_unix = tr.planned_unix
+                tr.lag_flagged = True
+                self.n_flagged += 1
+            self.n_reported += 1
+
+    def lag_stats(self) -> Dict:
+        with self._lock:
+            lags = [t.display_lag_s for t in self.schedule.trials
+                    if t.display_lag_s is not None]
+            flagged = self.n_flagged
+        if not lags:
+            return {"n": 0, "flagged": flagged}
+        arr = np.asarray(lags, dtype=float) * 1000.0
+        return {"n": len(lags), "median_ms": float(np.median(arr)),
+                "max_ms": float(np.max(np.abs(arr))), "flagged": int(flagged)}
+
+
+def run_calibration_scheduled(
+    serial_port: str,
+    schedule: CueSchedule,
+    ch_names: List[str],
+    timeline: Timeline,
+    board: str = DEFAULT_BOARD,
+    on_trial: Optional[Callable[[int], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> Dict:
+    """Record a pre-planned timeline while the browser presents the cues.
+
+    This side does no presentation at all: it opens the board, keeps it streaming
+    until the planned end, and reports which trial the clock is on so the server
+    can show progress.
+    """
+    def drive(rec: BoardRecorder) -> None:
+        n = len(schedule.trials)
+        last = -1
+        while True:
+            now = time.time()
+            if now >= timeline.end_at:
+                break
+            if should_stop is not None and should_stop():
+                raise KeyboardInterrupt("calibration aborted")
+            idx = sum(1 for r in timeline.rows if r["action_at"] <= now)
+            if idx != last and on_trial is not None:
+                last = idx
+                on_trial(min(idx, n))
+            time.sleep(0.1)
+        if on_trial is not None:
+            on_trial(n)
+
+    return _record(serial_port, schedule, ch_names, drive, board=board)

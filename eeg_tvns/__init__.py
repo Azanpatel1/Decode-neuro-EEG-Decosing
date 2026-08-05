@@ -10,6 +10,8 @@ Public API:
         build_pipeline, RiemannianAlignment,
         evaluate_cross_subject, evaluate_within_subject, permutation_chance,
         RealTimeDecoder, benchmark_latency,
+        train,                      # the one training path (CLI and dashboard)
+        SessionManager,             # owns the board, the modes, and the ARM switch
     )
 """
 from .config import Config, LOW_DENSITY_MONTAGE
@@ -35,8 +37,13 @@ from .signal_quality import (
     measure_impedance,
     scalp_positions,
 )
+from .boards import DEFAULT_BOARD, board_choices, list_serial_ports, probe_board
+from .models import discover_models, gating_verdict, inspect_model
+from .training import train
+from .jobs import Job, JobRunner
+from .session import Busy, SessionManager
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 __all__ = [
     "Config",
@@ -64,4 +71,17 @@ __all__ = [
     "measure_impedance",
     "impedance_from_std_uv",
     "scalp_positions",
+    # Board registry and control plane
+    "DEFAULT_BOARD",
+    "board_choices",
+    "list_serial_ports",
+    "probe_board",
+    "discover_models",
+    "gating_verdict",
+    "inspect_model",
+    "train",
+    "Job",
+    "JobRunner",
+    "Busy",
+    "SessionManager",
 ]

@@ -30,6 +30,7 @@ from typing import Callable, List, Optional
 import joblib
 import numpy as np
 
+from .boards import DEFAULT_BOARD, board_choices, resolve_board_id
 from .config import Config
 from .preprocessing import (
     apply_filters,
@@ -124,19 +125,21 @@ class BaseStreamer:
 # ---------------------------------------------------------------------------
 class OpenBCIStreamer(BaseStreamer):
     def __init__(self, serial_port: str, cfg: Config, model_sfreq: float,
-                 channel_order=None, resample: bool = True):
+                 channel_order=None, resample: bool = True,
+                 board: str = DEFAULT_BOARD):
         super().__init__(cfg, model_sfreq, channel_order, resample)
         self.serial_port = serial_port
+        self.board_name = board
 
     def _open(self):
-        from brainflow.board_shim import BoardShim, BrainFlowInputParams, BoardIds
+        from brainflow.board_shim import BoardShim, BrainFlowInputParams
 
-        self.board_id = BoardIds.CYTON_DAISY_BOARD           # 16 ch, id=2
+        self.board_id = resolve_board_id(self.board_name)
         params = BrainFlowInputParams()
         params.serial_port = self.serial_port
         self.board = BoardShim(self.board_id, params)
-        self.board_fs = float(BoardShim.get_sampling_rate(self.board_id))   # 125 Hz
-        self.eeg_rows = BoardShim.get_eeg_channels(self.board_id)           # 16 rows
+        self.board_fs = float(BoardShim.get_sampling_rate(self.board_id))
+        self.eeg_rows = BoardShim.get_eeg_channels(self.board_id)
         self.n_source_channels = len(self.eeg_rows)
         self.board.prepare_session()
         self.board.start_stream()
@@ -201,8 +204,11 @@ def run_loop(
                 n_fire += 1
                 fired = True
                 decoder.update_reference(win)       # online recentering after event
+            # A GO event is what happened here; whether the stimulator was actually
+            # triggered is `fire_tvns`'s to report, since a caller may gate it (see
+            # SessionManager._gated_fire). This line must not claim the trigger.
             log.info("p_go=%.3f  latency=%.2f ms  GO=%s%s",
-                     d.probability, d.latency_ms, d.go, "  <FIRE>" if fired else "")
+                     d.probability, d.latency_ms, d.go, "  <GO EVENT>" if fired else "")
             if on_frame is not None:
                 try:
                     on_frame(win, d, fired)
@@ -271,6 +277,10 @@ def main(argv=None):
     ap.add_argument("--channel-names", default=None,
                     help="comma-separated physical board channel labels, in board order, "
                          "to remap onto the model's trained montage (e.g. 'F7,F8,FC5,...').")
+    ap.add_argument("--board", default=DEFAULT_BOARD,
+                    choices=[b["id"] for b in board_choices()],
+                    help="which OpenBCI board is connected; sets the channel count "
+                         "and sample rate.")
     args = ap.parse_args(argv)
 
     bundle, cfg, decoder, model_sfreq, n_model_ch = load_decoder(args.model)
@@ -283,6 +293,7 @@ def main(argv=None):
     streamer = OpenBCIStreamer(
         args.port, cfg, model_sfreq,
         channel_order=channel_order, resample=not args.no_resample,
+        board=args.board,
     )
 
     with streamer:

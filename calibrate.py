@@ -24,6 +24,7 @@ import os
 import sys
 import time
 
+from eeg_tvns.boards import DEFAULT_BOARD, board_choices
 from eeg_tvns.calibrate import (
     ATTEMPT,
     REST,
@@ -90,6 +91,9 @@ def main(argv=None) -> int:
                     help="length of the analysed window per trial")
     ap.add_argument("--out-dir", default="calib")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--board", default=DEFAULT_BOARD,
+                    choices=[b["id"] for b in board_choices()],
+                    help="which OpenBCI board is connected (default cyton_daisy)")
     ap.add_argument("--check-signal", action="store_true",
                     help="report per-electrode contact quality and exit (no recording)")
     ap.add_argument("--no-impedance", action="store_true",
@@ -112,7 +116,8 @@ def main(argv=None) -> int:
         try:
             q = check_signal(args.port, ch_names, line_freq=args.line_freq,
                              impedance=not args.no_impedance,
-                             impedance_input=args.impedance_input)
+                             impedance_input=args.impedance_input,
+                             board=args.board)
         except Exception as exc:
             print(f"{YELLOW}Signal check failed:{RESET} {exc}")
             return 1
@@ -147,7 +152,7 @@ def main(argv=None) -> int:
         return 1
 
     try:
-        rec = run_calibration(args.port, sched, ch_names, present)
+        rec = run_calibration(args.port, sched, ch_names, present, board=args.board)
     except KeyboardInterrupt:
         print("\nAborted; nothing saved.")
         return 1
@@ -165,7 +170,7 @@ def main(argv=None) -> int:
     save_calibration(
         path, rec["X"], rec["y_go"], rec["y_word"], rec["ch_names"], rec["sfreq"],
         subject=args.subject, session=args.session, action_s=rec["action_s"],
-        paradigm="overt",
+        paradigm="overt", cue_source="terminal",
     )
     n_att = int((rec["y_go"] == ATTEMPT).sum())
     n_rest = int((rec["y_go"] == REST).sum())

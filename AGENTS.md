@@ -35,6 +35,12 @@ Everything is open source: **pyRiemann · MNE · scikit-learn · BrainFlow**.
 Golden Constraint 5 and Invariant F. Training needs ds003626 on disk; the live
 loop needs an OpenBCI board. Both fail loudly when those are absent.
 
+The operator surface is `dashboard.py`: a browser control plane that owns the board
+and runs the whole workflow — probe hardware, check electrode contact, record
+calibration, train and assign decoders, run the closed loop, watch it. It boots with
+nothing connected. Firing the stimulator sits behind an explicit ARM switch that
+defaults off (Invariant G).
+
 ---
 
 ## 2. Golden constraints (the "why" behind decisions — respect these)
@@ -66,21 +72,32 @@ eeg_tvns_pipeline/
 ├── AGENTS.md              ← this file
 ├── README.md             human-facing usage guide
 ├── requirements.txt      core deps (brainflow/openneuro-py optional, commented)
-├── run.py                CLI: load → evaluate → fit → save model → latency + plots
+├── run.py                thin CLI over eeg_tvns.training.train
 ├── calibrate.py          thin root entry point for the calibration recorder
 ├── acquisition.py        thin root entry point for the live loop
-├── dashboard.py          thin root entry point for the live browser dashboard
+├── dashboard.py          thin root entry point for the dashboard / control plane
+├── tools/
+│   ├── fake_board.py     BoardShim test double (transport only; emits a ramp)
+│   └── verify_control_plane.py  hardware-free guardrail suite
 └── eeg_tvns/
     ├── __init__.py       public API + version
     ├── config.py         Config dataclass — the single source of run settings
     ├── preprocessing.py  SHARED band-pass/notch/resample (train + live use this)
     ├── data_loader.py    ds003626 + calibration loaders, montage select (real only)
     ├── calibrate.py      same-session cued attempt/rest recorder (GO training)
+    ├── signal_quality.py ADS1299 impedance + live contact metrics + scalp layout
     ├── pipeline.py       Covariances → RiemannianAlignment → TangentSpace → clf
     ├── evaluate.py       leakage-free LOSO + within-subject + permutation chance
+    ├── training.py       train(cfg, progress, should_stop) — the ONLY training path
     ├── realtime.py       RealTimeDecoder (GO gate + online recentering) + latency
     ├── acquisition.py    live OpenBCI streamer + closed loop (no simulator)
-    └── dashboard.py      FastAPI/WebSocket live monitor (observes run_loop only)
+    ├── boards.py         board registry, port enumeration, probing, error text
+    ├── models.py         bundle discovery/inspection + gating verdicts
+    ├── jobs.py           one-at-a-time background job with progress and logs
+    ├── live.py           FrameHub, AcquisitionThread, WordReadout (display side)
+    ├── session.py        SessionManager: board modes, ARM switch, audit log
+    ├── dashboard.py      FastAPI routes + WebSocket over a SessionManager
+    └── web/              index.html, app.js, style.css (the five-tab UI)
 ```
 
 Data flow, offline → online:
@@ -90,8 +107,20 @@ OFFLINE:  load_dataset → preprocess → Covariances → RiemannianAlignment
           → TangentSpace → LDA → evaluate (LOSO) → joblib bundle
 
 ONLINE:   board window → reorder channels → SAME preprocess → resample to model
-          rate → RealTimeDecoder.decode → GO? → fire_tvns() → update_reference
+          rate → RealTimeDecoder.decode → GO? → ARMED? → fire_tvns()
+          → update_reference
 ```
+
+The dashboard is a control plane, not just a view. `SessionManager` owns the board
+through one mode at a time (`idle | probing | signal_check | calibrating |
+decoding`), because the serial port is exclusive and two activities sharing it fail
+as garbage data rather than cleanly. A request arriving while another mode holds the
+board is refused with `Busy` → HTTP 409; do not make it queue or force the port.
+
+`fire_tvns` is reachable only through `SessionManager._gated_fire`, which requires
+an armed session (see section 4G). Control-plane work — probing, contact checks,
+training — stays off the decision path (Invariant E); training is refused outright
+while decoding.
 
 ---
 
@@ -113,11 +142,14 @@ before splitting.
 
 **C. The GO decoder gates stimulation, not the word decoder.** Multi-class
 imagined-word identity is unreliable in patients. Stimulation timing must come
-from the binary GO decoder. Keep that separation. The dashboard's word readout
-(`dashboard.WordReadout`) upholds this structurally: it runs inside the `on_frame`
-*observer*, which `run_loop` calls only after it has already made and acted on its
-GO decision, so the word decoder has no path into the fire logic. Do not move it
-into `run_loop` or let it influence `fire_tvns`.
+from the binary GO decoder. Keep that separation. The word readout
+(`live.WordReadout`, re-exported as `dashboard.WordReadout`) upholds this
+structurally: it runs inside the `on_frame` *observer*, which `run_loop` calls only
+after it has already made and acted on its GO decision, so the word decoder has no
+path into the fire logic. Do not move it into `run_loop` or let it influence
+`fire_tvns`. `SessionManager.assign_model` additionally **rejects** a `task ==
+"word"` bundle for the GO slot, so this holds at the API boundary and not only by
+convention. Keep that rejection.
 
 **D. Channel order must be explicit.** The live board's channels must be remapped
 to the model's trained montage (`bundle["ch_names"]`). Never assume identity
@@ -135,6 +167,26 @@ inline `rng.normal(...)` fallback for a missing window — not even "just for th
 demo" or "just for tests". If a code path cannot run without data or hardware, it
 must fail loudly with an actionable message instead of producing numbers. The
 corollary: an empty dashboard is a *correct* dashboard when nothing is connected.
+
+This extends to the test scaffolding. `tools/fake_board.py` stands in for the
+BrainFlow *transport* and emits an obvious per-channel ramp; it must never be made
+to emit anything EEG-like, or it becomes the simulator this invariant forbids.
+
+**G. Stimulation requires an explicit ARM, and the display must not overstate it.**
+`fire_tvns` has exactly one caller in the dashboard path,
+`SessionManager._gated_fire`, and it fires only when `arm()` has succeeded. Arming
+requires a running loop, a loopback binding (unless `--allow-remote-arm`), the GO
+model's filename echoed back, and an acknowledgement when
+`models.gating_verdict` says that model is not validated for gating. It auto-disarms
+on stop, on any GO-model change or rewrite, and after `max_armed_s`. Do not add a
+second path to the stimulator, do not default ARM to on, and do not relax the
+loopback rule.
+
+The monitor counts **GO events** (threshold crossings past the refractory window)
+separately from **stimulations** (crossings that actually reached the device), via
+the `stimulated` flag `AcquisitionThread` passes to `FrameHub.publish`. Never
+collapse them back into one counter: a display that counted a suppressed crossing
+as a stimulation would be claiming something happened to the patient that did not.
 
 ---
 
@@ -191,10 +243,11 @@ python run.py --data ./ds003626 --task word --no-align
 python acquisition.py --port /dev/cu.usbserial-XXXX --model outputs/model_go.joblib --duration 8
 #    -> logs p_go, latency, GO, and ">>> tVNS FIRE" events
 
-# 5. Live browser dashboard (traces + p_go + word readout + trigger window)
+# 5. Dashboard / control plane. Boots with nothing connected: --port and --model
+#    only pre-fill the form. Everything in steps 1-4 can be driven from the tabs.
 pip install "fastapi>=0.110,<0.120" "uvicorn>=0.27,<0.35" "websockets>=12"
-python dashboard.py --port /dev/cu.usbserial-XXXX --model outputs/model_go.joblib
-#    -> open http://127.0.0.1:8765
+python dashboard.py
+#    -> open http://127.0.0.1:8765; the loop always starts DISARMED
 ```
 
 **Expected sanity signals:** online latency is single-digit milliseconds, far under
@@ -214,20 +267,30 @@ not "improve" these by loosening the evaluation:
 | GO, baseline-block rest | 0.920 | 0.500 | confounded; block identity |
 | GO, same-block rest (0.5 s control) | 0.540 | 0.500 | the honest estimate |
 
-**Verifying without data or hardware** — you can still check that the code
-imports, the CLIs parse, and the guardrails hold. These must all fail loudly
-rather than invent data:
+**Verifying without data or hardware** — run the guardrail suite. It exercises the
+session state machine and its 409s, every ARM refusal, Invariant C at the API, the
+cue timeline and display-lag arithmetic, the job runner, model gating verdicts, and
+the absence of any way to fabricate a signal. Board-dependent paths run against
+`tools/fake_board.py`:
+
+```bash
+python tools/verify_control_plane.py   # ~15 s, no network, no hardware
+```
+
+It must end `0 failed`. **Run it after any change to `session.py`, `dashboard.py`,
+`live.py`, `jobs.py`, `models.py`, `boards.py`, or the files in `web/`,** and extend
+it when you add a guardrail. Individual smoke checks, still true:
 
 ```bash
 python -c "import eeg_tvns; print(eeg_tvns.__version__)"
-python run.py --task go            # must exit: --data is required
-python dashboard.py                # must exit: --port is required
+python run.py --task go            # must exit: --data or --calibration is required
+python dashboard.py --help         # --port is optional now; the UI picks one
 ```
 
-There is no formal test suite yet (see task T5). Until then, the commands above
-are the acceptance smoke test — **run what your change touches** and confirm the
-signals above still hold. Do not add a synthetic mode to make the smoke test
-easier to run.
+There is no pytest suite yet (see task T5); the suite above plus the commands in
+this section are the acceptance smoke test — **run what your change touches** and
+confirm the signals above still hold. Do not add a synthetic mode to make any of
+this easier to run.
 
 ---
 
@@ -237,8 +300,10 @@ easier to run.
 Location: `eeg_tvns/acquisition.py` (`fire_tvns` stub). Replace the log stub with
 the device trigger (serial command / GPIO / TTL pulse / vendor SDK). Keep it a
 fast, non-blocking call — it runs inside the loop and must not blow the latency
-budget. *Accept when:* a real or mocked trigger fires on GO and the loop's median
-latency stays < `Config.latency_budget_ms`.
+budget. Keep it reachable only through `SessionManager._gated_fire` on the
+dashboard path (Invariant G); do not add a second call site. *Accept when:* a real
+or mocked trigger fires on GO **while armed**, nothing fires while disarmed, and the
+loop's median latency stays < `Config.latency_budget_ms`.
 
 **T2 — DONE. True "rest" epochs for the GO decoder.**
 `data_loader._build_rest_from_baseline` builds the rest class from the dataset's
@@ -252,11 +317,14 @@ balanced and that GO LOSO beats its permutation baseline.
 Built: `eeg_tvns/calibrate.py` + `calibrate.py` record cued overt attempt vs rest
 randomly interleaved in one recording (runs capped at 3 so drift cannot align with
 class), stored raw at board rate; `data_loader.load_calibration` + `run.py
---calibration` train on it at the board's native rate. **Still open:** nobody has
-recorded real calibration data yet, so the GO decoder remains unvalidated. Until
-that exists, `outputs/model_go.joblib` is a ds003626 baseline-block model and must
-not gate stimulation. *Accept when:* a real recording exists, its GO score is
-reported next to the 0.54 same-block control, and it beats that control.
+--calibration` train on it at the board's native rate. The dashboard's Calibrate
+tab drives the same recorder with browser-presented cues and stores the measured
+per-trial `display_lag_s`. **Still open:** nobody has recorded real calibration data
+yet, so the GO decoder remains unvalidated. Until that exists,
+`outputs/model_go.joblib` is a ds003626 baseline-block model and must not gate
+stimulation — `models.gating_verdict` marks it as such, and the dashboard requires
+an explicit acknowledgement to arm it. *Accept when:* a real recording exists, its
+GO score is reported next to the 0.54 same-block control, and it beats that control.
 
 Background — why this task exists: ds003626's only rest is a separate baseline
 block. At a matched 0.5 s window, holding the action epochs fixed and changing
@@ -267,8 +335,11 @@ GO numbers reflect block identity, not speech attempt.
 **T3 — Add stimulation control arms.**
 Add `paired` (current behavior), `unpaired/delayed`, and `sham` modes to
 `run_loop` (config flag), so the experiment can show the effect is timing-
-specific. *Accept when:* a `--mode {paired,delayed,sham}` flag changes when/if
-`fire_tvns` is called, and each mode is logged in the run summary.
+specific. Route them through `SessionManager._gated_fire` so ARM still governs, and
+expose the mode on the Hardware tab and in the audit log. *Accept when:* a
+`--mode {paired,delayed,sham}` flag changes when/if `fire_tvns` is called, each mode
+is logged in the run summary, and the monitor's stimulation count still reflects only
+real device triggers (Invariant G).
 
 **T4 — Optional: train at the board's native rate.**
 125 Hz board vs. 256 Hz model currently reconciled by online resampling. Add a
@@ -281,9 +352,11 @@ Cover: preprocessing parity (offline vs. online filter output identical for the
 same input), latency under budget, `load_dataset` raising without `--data`, and
 both CLIs rejecting a missing `--port`/`--data`. Fixtures must be either a small
 **real** recording committed as test data or a recorded window replayed from disk
-— never a generator (Invariant F). Accuracy/alignment tests need real epochs, so
-scope them to a checked-in subject subset or mark them as requiring ds003626.
-*Accept when:* `pytest` passes locally with no network or hardware.
+— never a generator (Invariant F); `tools/fake_board.py` may stand in for the
+transport. Fold in `tools/verify_control_plane.py`, which already covers the
+control-plane guardrails and is the model to follow. Accuracy/alignment tests need
+real epochs, so scope them to a checked-in subject subset or mark them as requiring
+ds003626. *Accept when:* `pytest` passes locally with no network or hardware.
 
 When you pick up a task, keep changes scoped to it and re-run the section-6 smoke
 test before declaring done.
@@ -321,7 +394,18 @@ test before declaring done.
 - Don't reintroduce synthetic data or a simulated stream in any form — no
   `make_synthetic`, no `SimulatedStreamer`, no `--synthetic`/`--simulate`, no
   random-noise fallback for a missing window or a missing dataset (Invariant F /
-  Golden Constraint 5). Prefer a loud failure over a plausible-looking trace.
+  Golden Constraint 5). Prefer a loud failure over a plausible-looking trace. That
+  includes making `tools/fake_board.py` emit anything that resembles EEG.
+- Don't weaken the ARM path: no ARM-on-by-default, no second caller of `fire_tvns`,
+  no dropping the loopback rule, the typed confirmation, or the unvalidated-model
+  acknowledgement (Invariant G).
+- Don't report a suppressed GO event as a stimulation anywhere in the UI, and don't
+  merge the two counters.
+- Don't duplicate the training pipeline for the dashboard. `run.py` and the Train
+  tab both go through `eeg_tvns.training.train`; two copies would drift into
+  producing different models from the same inputs.
+- Don't run heavy work on a request handler or inside `run_loop`. Long jobs belong
+  in `jobs.JobRunner`, and hardware activities in a `SessionManager` mode.
 
 ---
 
@@ -342,3 +426,13 @@ test before declaring done.
   the real data source. Includes overt (pronounced) and imagined conditions.
 - **pairing window** — the short (~300–400 ms) interval after a speech attempt in
   which VNS must fire to reinforce it.
+- **ARM** — the explicit, revocable permission for the closed loop to trigger the
+  stimulator. Off by default; see Invariant G.
+- **GO event vs stimulation** — a GO event is a threshold crossing past the
+  refractory window; a stimulation is one that actually reached the device. They
+  differ whenever the session is disarmed.
+- **gating verdict** — `models.gating_verdict`'s judgement of whether a bundle is fit
+  to gate stimulation (e.g. a ds003626 GO model is not, because its rest class is a
+  separate recording block).
+- **mode** — which activity currently owns the board: `idle`, `probing`,
+  `signal_check`, `calibrating`, `decoding`. Exclusive, because the serial port is.

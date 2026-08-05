@@ -31,7 +31,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -240,6 +240,7 @@ def measure_impedance(
     input_side: str = "n",
     seconds: float = 2.0,
     settle_s: float = 0.5,
+    on_channel: Optional[Callable[[int, str], None]] = None,
 ) -> List[ChannelQuality]:
     """Measure per-channel impedance by injecting the ADS1299 lead-off current.
 
@@ -249,9 +250,12 @@ def measure_impedance(
     impedance is reported only if the tone actually rose, so a wrong `input_side`
     surfaces as "no test signal detected" instead of a bogus value.
 
-    `input_side` is "n" or "p" -- which ADS input the current drives. Which one is
+        `input_side` is "n" or "p" -- which ADS input the current drives. Which one is
     correct depends on how your electrodes and reference are wired; if every
     channel reports no test signal, try the other side.
+
+    `on_channel(i, name)` is called before each channel is measured, so a caller
+    can show progress across what is a slow (seconds per channel) sweep.
     """
     side = input_side.lower()
     if side not in ("n", "p"):
@@ -269,6 +273,11 @@ def measure_impedance(
     for i, row in enumerate(eeg_rows):
         name = str(ch_names[i]) if i < len(ch_names) else f"CH{i + 1}"
         q = ChannelQuality(index=i, name=name)
+        if on_channel is not None:
+            try:
+                on_channel(i, name)
+            except Exception:
+                log.exception("on_channel callback failed; continuing")
 
         try:
             board.get_board_data()          # drain stale samples
